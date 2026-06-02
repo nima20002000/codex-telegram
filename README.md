@@ -23,7 +23,8 @@ Edit `.env`:
 ```bash
 TELEGRAM_BOT_TOKEN=123456:from-botfather
 TELEGRAM_ALLOWED_USERS=123456789
-CODEX_WORKDIR=$HOME/Desktop/hermes-telegram
+CODEX_WORKDIR=$HOME/Desktop
+HERMES_TELEGRAM_STATE_DIR=$HOME/Desktop/hermes-telegram/.hermes-telegram
 ```
 
 Then run:
@@ -38,6 +39,22 @@ Or install the package in editable mode and use the console script:
 python3 -m pip install -e .
 hermes-telegram --env-file .env
 ```
+
+## Run On Startup
+
+Install the user service:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/systemd/hermes-telegram.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now hermes-telegram.service
+loginctl enable-linger "$USER"
+```
+
+The committed unit assumes the checkout stays at `$HOME/Desktop/hermes-telegram`.
+It reads the ignored `.env`, runs Codex in `CODEX_WORKDIR`, and restarts the bridge if
+the process exits.
 
 ## Commands
 
@@ -73,6 +90,9 @@ Telegram options:
 - `TELEGRAM_POLL_TIMEOUT_SECONDS`: defaults to `30`
 - `TELEGRAM_REQUEST_TIMEOUT_SECONDS`: defaults to `45`
 - `MAX_TELEGRAM_RESPONSE_CHARS`: defaults to `12000`
+
+Bridge options:
+
 - `SESSION_HISTORY_TURNS`: defaults to `8`
 - `HERMES_TELEGRAM_STATE_DIR`: defaults to `$CODEX_WORKDIR/.hermes-telegram`
 
