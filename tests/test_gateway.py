@@ -71,6 +71,14 @@ class FakeModelCatalog:
                 return model
         return None
 
+    def is_authoritative(self):
+        return True
+
+
+class NonAuthoritativeModelCatalog(FakeModelCatalog):
+    def is_authoritative(self):
+        return False
+
 
 class GatewayTests(unittest.TestCase):
     def _settings(self, workdir: Path, *, allowed_users=frozenset({42})) -> Settings:
@@ -292,6 +300,44 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(preference.reasoning_effort, "xhigh")
             self.assertEqual(codex.runs[-1], ("gpt-5.5", "xhigh"))
             self.assertIn("Selected GPT-5.5", telegram.edits[0][2])
+
+    def test_unavailable_saved_model_is_ignored_and_cleared(self):
+        with TemporaryDirectory() as tmp:
+            telegram = FakeTelegram()
+            codex = FakeCodex("finished")
+            store = SessionStore(Path(tmp) / "state")
+            store.save_model_preference("100", model="gpt-5.2", reasoning_effort="medium")
+            gateway = HermesTelegramGateway(
+                settings=self._settings(Path(tmp)),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("do the task"))
+
+            self.assertEqual(codex.runs[-1], (None, None))
+            self.assertIsNone(store.load_model_preference("100"))
+
+    def test_saved_model_is_kept_when_catalog_is_not_authoritative(self):
+        with TemporaryDirectory() as tmp:
+            telegram = FakeTelegram()
+            codex = FakeCodex("finished")
+            store = SessionStore(Path(tmp) / "state")
+            store.save_model_preference("100", model="gpt-5.2", reasoning_effort="medium")
+            gateway = HermesTelegramGateway(
+                settings=self._settings(Path(tmp)),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=NonAuthoritativeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("do the task"))
+
+            self.assertEqual(codex.runs[-1], ("gpt-5.2", "medium"))
+            self.assertIsNotNone(store.load_model_preference("100"))
 
     def test_poll_once_advances_offset_when_handler_raises(self):
         with TemporaryDirectory() as tmp:

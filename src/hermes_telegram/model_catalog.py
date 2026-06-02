@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from dataclasses import dataclass
 
 
@@ -21,11 +22,26 @@ FALLBACK_MODELS = (
 
 
 class CodexModelCatalog:
-    def __init__(self, codex_command: str, *, timeout_seconds: int = 10):
+    def __init__(self, codex_command: str, *, timeout_seconds: int = 10, cache_ttl_seconds: int = 300):
         self._codex_command = codex_command
         self._timeout_seconds = timeout_seconds
+        self._cache_ttl_seconds = cache_ttl_seconds
+        self._cache: tuple[ModelChoice, ...] | None = None
+        self._cache_loaded_at: float | None = None
+        self._authoritative = False
+
+    def _fallback_models(self) -> tuple[ModelChoice, ...]:
+        self._authoritative = False
+        return self._cache or FALLBACK_MODELS
 
     def list_models(self) -> tuple[ModelChoice, ...]:
+        now = time.monotonic()
+        if (
+            self._cache is not None
+            and self._cache_loaded_at is not None
+            and now - self._cache_loaded_at < self._cache_ttl_seconds
+        ):
+            return self._cache
         try:
             completed = subprocess.run(
                 [self._codex_command, "debug", "models"],
@@ -35,16 +51,16 @@ class CodexModelCatalog:
                 check=False,
             )
         except Exception:
-            return FALLBACK_MODELS
+            return self._fallback_models()
         if completed.returncode != 0:
-            return FALLBACK_MODELS
+            return self._fallback_models()
         try:
             payload = json.loads(completed.stdout)
         except json.JSONDecodeError:
-            return FALLBACK_MODELS
+            return self._fallback_models()
         raw_models = payload.get("models", [])
         if not isinstance(raw_models, list):
-            return FALLBACK_MODELS
+            return self._fallback_models()
 
         choices: list[ModelChoice] = []
         for item in raw_models:
@@ -64,10 +80,17 @@ class CodexModelCatalog:
             if not isinstance(default_effort, str) or default_effort not in efforts:
                 default_effort = efforts[0] if efforts else "medium"
             choices.append(ModelChoice(slug, display_name, tuple(efforts or ("medium",)), default_effort))
-        return tuple(choices) or FALLBACK_MODELS
+        self._cache = tuple(choices) or FALLBACK_MODELS
+        self._cache_loaded_at = now
+        self._authoritative = True
+        return self._cache
 
     def get_model(self, slug: str) -> ModelChoice | None:
         for model in self.list_models():
             if model.slug == slug:
                 return model
         return None
+
+    def is_authoritative(self) -> bool:
+        self.list_models()
+        return self._authoritative

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from .codex_runner import CodexRunner
 from .config import Settings
 from .model_catalog import CodexModelCatalog, ModelChoice
-from .session_store import SessionStore
+from .session_store import ChatModelPreference, SessionStore
 from .telegram_api import IncomingCallback, IncomingMessage, TelegramAPI, parse_callback_update, parse_message_update
 
 logger = logging.getLogger(__name__)
@@ -46,8 +46,34 @@ class HermesTelegramGateway:
         self._sessions = sessions
         self._offset: int | None = None
 
+    def _active_model_preference(self, chat_id: str | None) -> ChatModelPreference | None:
+        if chat_id is None:
+            return None
+        preference = self._sessions.load_model_preference(chat_id)
+        if preference is None:
+            return None
+        model = self._model_catalog.get_model(preference.model)
+        if not self._model_catalog.is_authoritative():
+            logger.warning(
+                "Keeping model preference after non-authoritative model lookup chat=%s model=%s effort=%s",
+                chat_id,
+                preference.model,
+                preference.reasoning_effort,
+            )
+            return preference
+        if model is not None and preference.reasoning_effort in model.reasoning_efforts:
+            return preference
+        logger.warning(
+            "Ignoring unavailable model preference chat=%s model=%s effort=%s",
+            chat_id,
+            preference.model,
+            preference.reasoning_effort,
+        )
+        self._sessions.clear_model_preference(chat_id)
+        return None
+
     def status(self, chat_id: str | None = None) -> GatewayStatus:
-        preference = self._sessions.load_model_preference(chat_id) if chat_id is not None else None
+        preference = self._active_model_preference(chat_id)
         return GatewayStatus(
             workdir=str(self._settings.codex_workdir),
             allowed_users=len(self._settings.allowed_users),
@@ -155,7 +181,7 @@ class HermesTelegramGateway:
             self._telegram.send_chat_action(message.chat_id)
         except Exception:
             logger.warning("Failed to send Telegram typing indicator", exc_info=True)
-        preference = self._sessions.load_model_preference(message.chat_id)
+        preference = self._active_model_preference(message.chat_id)
         result = self._codex.run(
             prompt,
             model=preference.model if preference else None,

@@ -144,3 +144,10 @@ class SessionStore:
         preferences = self._load_preferences()
         preferences[chat_id] = {"model": model, "reasoning_effort": reasoning_effort}
         self._save_preferences(preferences)
+
+    def clear_model_preference(self, chat_id: str) -> None:
+        preferences = self._load_preferences()
+        if chat_id not in preferences:
+            return
+        del preferences[chat_id]
+        self._save_preferences(preferences)

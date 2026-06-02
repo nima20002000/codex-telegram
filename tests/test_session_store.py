@@ -43,6 +43,9 @@ class SessionStoreTests(unittest.TestCase):
             self.assertEqual(preference.model, "gpt-5.5")
             self.assertEqual(preference.reasoning_effort, "xhigh")
 
+            store.clear_model_preference("chat")
+            self.assertIsNone(store.load_model_preference("chat"))
+
 
 if __name__ == "__main__":
     unittest.main()

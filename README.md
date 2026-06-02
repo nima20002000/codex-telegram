@@ -83,7 +83,7 @@ Recommended:
 
 Codex options:
 
-- `CODEX_COMMAND`: defaults to `codex`
+- `CODEX_COMMAND`: defaults to `codex`; use an absolute path when running under systemd if your shell gets Codex from `nvm`, `asdf`, or another shell-managed path
 - `CODEX_MODEL`: optional model override
 - `CODEX_PROFILE`: optional Codex config profile
 - `CODEX_SANDBOX`: defaults to `workspace-write`
