@@ -1,0 +1,87 @@
+# Hermes Telegram
+
+Standalone Telegram bridge for running Codex from a Telegram bot chat.
+
+This repo extracts the useful Telegram gateway shape from Hermes into a small local service:
+
+- reads a Telegram bot token from `.env`
+- polls Telegram Bot API with `getUpdates`
+- gates access by Telegram user IDs and/or chat IDs
+- keeps compact per-chat local history under `.hermes-telegram/`
+- runs `codex exec` in the configured local workspace
+- replies to Telegram with the final Codex response
+
+## Setup
+
+```bash
+cd $HOME/Desktop/hermes-telegram
+cp .env.example .env
+```
+
+Edit `.env`:
+
+```bash
+TELEGRAM_BOT_TOKEN=123456:from-botfather
+TELEGRAM_ALLOWED_USERS=123456789
+CODEX_WORKDIR=$HOME/Desktop/hermes-telegram
+```
+
+Then run:
+
+```bash
+PYTHONPATH=src python3 -m hermes_telegram.cli --env-file .env
+```
+
+Or install the package in editable mode and use the console script:
+
+```bash
+python3 -m pip install -e .
+hermes-telegram --env-file .env
+```
+
+## Commands
+
+- `/start` or `/help`: show help
+- `/status`: show the configured Codex workspace and allowlist counts
+- `/reset`: clear this Telegram chat's local bridge history
+
+Any other text message is sent to `codex exec`.
+
+## Environment
+
+Required:
+
+- `TELEGRAM_BOT_TOKEN`: bot token from BotFather
+
+Recommended:
+
+- `TELEGRAM_ALLOWED_USERS`: comma-separated numeric Telegram user IDs
+- `TELEGRAM_ALLOWED_CHATS`: optional comma-separated chat IDs
+- `CODEX_WORKDIR`: directory where Codex should work
+
+Codex options:
+
+- `CODEX_COMMAND`: defaults to `codex`
+- `CODEX_MODEL`: optional model override
+- `CODEX_PROFILE`: optional Codex config profile
+- `CODEX_SANDBOX`: defaults to `workspace-write`
+- `CODEX_EXTRA_ARGS`: extra shell-split args inserted after `codex exec`
+- `CODEX_TIMEOUT_SECONDS`: defaults to `1800`
+
+Telegram options:
+
+- `TELEGRAM_POLL_TIMEOUT_SECONDS`: defaults to `30`
+- `TELEGRAM_REQUEST_TIMEOUT_SECONDS`: defaults to `45`
+- `MAX_TELEGRAM_RESPONSE_CHARS`: defaults to `12000`
+- `SESSION_HISTORY_TURNS`: defaults to `8`
+- `HERMES_TELEGRAM_STATE_DIR`: defaults to `$CODEX_WORKDIR/.hermes-telegram`
+
+## Tests
+
+```bash
+PYTHONPATH=src python3 -m unittest discover -s tests
+```
+
+## Notes
+
+This bridge intentionally does not vendor the full `~/.hermes/hermes-agent` codebase. It extracts the Telegram-to-agent control path into a focused local repo. The agent side is Codex CLI, so the bot can work in whatever `CODEX_WORKDIR` points at.
