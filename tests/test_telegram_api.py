@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from hermes_telegram.telegram_api import parse_message_update, split_telegram_text
+from hermes_telegram.telegram_api import parse_callback_update, parse_message_update, split_telegram_text
 
 
 class TelegramAPITests(unittest.TestCase):
@@ -28,6 +28,30 @@ class TelegramAPITests(unittest.TestCase):
 
     def test_parse_ignores_non_text_update(self):
         self.assertIsNone(parse_message_update({"update_id": 1, "message": {"chat": {"id": 1}}}))
+
+    def test_parse_callback_update(self):
+        callback = parse_callback_update(
+            {
+                "update_id": 100,
+                "callback_query": {
+                    "id": "abc",
+                    "data": "effort:gpt-5.5:xhigh",
+                    "from": {"id": 42, "username": "nima"},
+                    "message": {
+                        "message_id": 8,
+                        "chat": {"id": 123, "type": "private"},
+                    },
+                },
+            }
+        )
+
+        self.assertIsNotNone(callback)
+        assert callback is not None
+        self.assertEqual(callback.update_id, 100)
+        self.assertEqual(callback.callback_query_id, "abc")
+        self.assertEqual(callback.chat_id, "123")
+        self.assertEqual(callback.user_id, 42)
+        self.assertEqual(callback.data, "effort:gpt-5.5:xhigh")
 
     def test_parse_ignores_edited_message_update(self):
         self.assertIsNone(

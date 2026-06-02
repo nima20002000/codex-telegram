@@ -31,6 +31,18 @@ class SessionStoreTests(unittest.TestCase):
             self.assertTrue(store.was_processed("chat", 10, 1))
             self.assertFalse(store.was_processed("chat", 11, 2))
 
+    def test_model_preference_round_trip(self):
+        with TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+
+            self.assertIsNone(store.load_model_preference("chat"))
+            store.save_model_preference("chat", model="gpt-5.5", reasoning_effort="xhigh")
+
+            preference = store.load_model_preference("chat")
+            self.assertIsNotNone(preference)
+            self.assertEqual(preference.model, "gpt-5.5")
+            self.assertEqual(preference.reasoning_effort, "xhigh")
+
 
 if __name__ == "__main__":
     unittest.main()

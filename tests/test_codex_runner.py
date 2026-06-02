@@ -71,6 +71,32 @@ class CodexRunnerTests(unittest.TestCase):
             self.assertIn("timed out", result.text)
             self.assertEqual(result.stderr, "too slow")
 
+    def test_runner_applies_per_chat_model_and_reasoning_override(self):
+        with TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            seen: dict[str, object] = {}
+
+            def fake_run(command, **kwargs):
+                seen["command"] = command
+                output_path = Path(command[command.index("--output-last-message") + 1])
+                output_path.write_text("final answer", encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with patch("subprocess.run", side_effect=fake_run):
+                CodexRunner(self._settings(workdir)).run(
+                    "do work",
+                    model="gpt-5.5",
+                    reasoning_effort="xhigh",
+                )
+
+            command = seen["command"]
+            self.assertIsInstance(command, list)
+            assert isinstance(command, list)
+            self.assertIn("--model", command)
+            self.assertEqual(command[command.index("--model") + 1], "gpt-5.5")
+            self.assertIn("-c", command)
+            self.assertIn('model_reasoning_effort="xhigh"', command)
+
 
 if __name__ == "__main__":
     unittest.main()

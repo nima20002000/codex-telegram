@@ -60,9 +60,14 @@ the process exits.
 
 - `/start` or `/help`: show help
 - `/status`: show the configured Codex workspace and allowlist counts
+- `/models`: choose a Codex model, then choose the thinking amount for this chat
 - `/reset`: clear this Telegram chat's local bridge history
 
 Any other text message is sent to `codex exec`.
+
+Model choices come from the local `codex debug models` catalog when available.
+The selected model and thinking amount are stored per Telegram chat under the
+bridge state directory and are applied to later agent messages from that chat.
 
 ## Environment
 

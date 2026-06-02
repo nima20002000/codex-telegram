@@ -15,6 +15,12 @@ class ChatTurn:
     text: str
 
 
+@dataclass(frozen=True)
+class ChatModelPreference:
+    model: str
+    reasoning_effort: str
+
+
 def _safe_chat_key(chat_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", chat_id).strip("_") or "chat"
 
@@ -26,6 +32,7 @@ class SessionStore:
         self._sessions_dir = state_dir / "sessions"
         self._sessions_dir.mkdir(parents=True, exist_ok=True)
         self._processed_path = state_dir / "processed_messages.json"
+        self._preferences_path = state_dir / "model_preferences.json"
 
     def _path(self, chat_id: str) -> Path:
         return self._sessions_dir / f"{_safe_chat_key(chat_id)}.json"
@@ -104,3 +111,36 @@ class SessionStore:
             return
         keys.append(key)
         self._save_processed(keys)
+
+    def _load_preferences(self) -> dict[str, dict[str, str]]:
+        if not self._preferences_path.exists():
+            return {}
+        raw = json.loads(self._preferences_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, dict[str, str]] = {}
+        for chat_id, value in raw.items():
+            if not isinstance(chat_id, str) or not isinstance(value, dict):
+                continue
+            model = value.get("model")
+            effort = value.get("reasoning_effort")
+            if isinstance(model, str) and isinstance(effort, str):
+                out[chat_id] = {"model": model, "reasoning_effort": effort}
+        return out
+
+    def _save_preferences(self, preferences: dict[str, dict[str, str]]) -> None:
+        self._preferences_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._preferences_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(preferences, indent=2), encoding="utf-8")
+        tmp.replace(self._preferences_path)
+
+    def load_model_preference(self, chat_id: str) -> ChatModelPreference | None:
+        raw = self._load_preferences().get(chat_id)
+        if raw is None:
+            return None
+        return ChatModelPreference(model=raw["model"], reasoning_effort=raw["reasoning_effort"])
+
+    def save_model_preference(self, chat_id: str, *, model: str, reasoning_effort: str) -> None:
+        preferences = self._load_preferences()
+        preferences[chat_id] = {"model": model, "reasoning_effort": reasoning_effort}
+        self._save_preferences(preferences)

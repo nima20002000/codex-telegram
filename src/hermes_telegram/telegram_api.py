@@ -23,6 +23,18 @@ class IncomingMessage:
     chat_type: str
 
 
+@dataclass(frozen=True)
+class IncomingCallback:
+    update_id: int
+    callback_query_id: str
+    chat_id: str
+    user_id: int | None
+    username: str
+    data: str
+    message_id: int | None
+    chat_type: str
+
+
 def parse_message_update(update: dict[str, Any]) -> IncomingMessage | None:
     message = update.get("message")
     if not isinstance(message, dict):
@@ -43,6 +55,39 @@ def parse_message_update(update: dict[str, Any]) -> IncomingMessage | None:
         user_id=user_id,
         username=str(username),
         text=text.strip(),
+        message_id=message.get("message_id"),
+        chat_type=str(chat.get("type") or ""),
+    )
+
+
+def parse_callback_update(update: dict[str, Any]) -> IncomingCallback | None:
+    callback = update.get("callback_query")
+    if not isinstance(callback, dict):
+        return None
+    data = callback.get("data")
+    if not isinstance(data, str) or not data:
+        return None
+    message = callback.get("message") or {}
+    if not isinstance(message, dict):
+        return None
+    chat = message.get("chat") or {}
+    if not isinstance(chat, dict):
+        return None
+    chat_id = chat.get("id")
+    if chat_id is None:
+        return None
+    sender = callback.get("from") or {}
+    if not isinstance(sender, dict):
+        sender = {}
+    user_id = sender.get("id") if isinstance(sender.get("id"), int) else None
+    username = sender.get("username") or sender.get("first_name") or ""
+    return IncomingCallback(
+        update_id=int(update["update_id"]),
+        callback_query_id=str(callback["id"]),
+        chat_id=str(chat_id),
+        user_id=user_id,
+        username=str(username),
+        data=data,
         message_id=message.get("message_id"),
         chat_type=str(chat.get("type") or ""),
     )
@@ -100,7 +145,7 @@ class TelegramAPI:
             {
                 "offset": offset,
                 "timeout": timeout,
-                "allowed_updates": ["message"],
+                "allowed_updates": ["message", "callback_query"],
             },
         )
         result = payload.get("result", [])
@@ -112,6 +157,7 @@ class TelegramAPI:
         text: str,
         *,
         reply_to_message_id: int | None = None,
+        reply_markup: dict[str, Any] | None = None,
     ) -> None:
         for chunk in split_telegram_text(text):
             self._request(
@@ -121,9 +167,33 @@ class TelegramAPI:
                     "text": chunk,
                     "reply_to_message_id": reply_to_message_id,
                     "disable_web_page_preview": True,
+                    "reply_markup": reply_markup,
                 },
             )
             reply_to_message_id = None
+            reply_markup = None
+
+    def edit_message_text(
+        self,
+        chat_id: str,
+        message_id: int,
+        text: str,
+        *,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
+        self._request(
+            "editMessageText",
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "disable_web_page_preview": True,
+                "reply_markup": reply_markup,
+            },
+        )
+
+    def answer_callback_query(self, callback_query_id: str, *, text: str | None = None) -> None:
+        self._request("answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text})
 
     def send_chat_action(self, chat_id: str, action: str = "typing") -> None:
         self._request("sendChatAction", {"chat_id": chat_id, "action": action})

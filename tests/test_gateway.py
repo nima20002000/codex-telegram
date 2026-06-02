@@ -7,20 +7,31 @@ from tempfile import TemporaryDirectory
 from hermes_telegram.codex_runner import CodexResult
 from hermes_telegram.config import Settings
 from hermes_telegram.gateway import HermesTelegramGateway
+from hermes_telegram.model_catalog import ModelChoice
 from hermes_telegram.session_store import SessionStore
-from hermes_telegram.telegram_api import IncomingMessage
+from hermes_telegram.telegram_api import IncomingCallback, IncomingMessage
 
 
 class FakeTelegram:
     def __init__(self, updates=None):
         self.messages: list[tuple[str, str, int | None]] = []
+        self.reply_markups: list[dict | None] = []
+        self.edits: list[tuple[str, int, str, dict | None]] = []
+        self.callback_answers: list[tuple[str, str | None]] = []
         self.actions: list[str] = []
         self.updates = list(updates or [])
         self.calls: list[tuple[int | None, int]] = []
         self.fail_chat_action = False
 
-    def send_message(self, chat_id, text, *, reply_to_message_id=None):
+    def send_message(self, chat_id, text, *, reply_to_message_id=None, reply_markup=None):
         self.messages.append((chat_id, text, reply_to_message_id))
+        self.reply_markups.append(reply_markup)
+
+    def edit_message_text(self, chat_id, message_id, text, *, reply_markup=None):
+        self.edits.append((chat_id, message_id, text, reply_markup))
+
+    def answer_callback_query(self, callback_query_id, *, text=None):
+        self.callback_answers.append((callback_query_id, text))
 
     def send_chat_action(self, chat_id, action="typing"):
         if self.fail_chat_action:
@@ -35,11 +46,30 @@ class FakeTelegram:
 class FakeCodex:
     def __init__(self, response="done"):
         self.prompts: list[str] = []
+        self.runs: list[tuple[str | None, str | None]] = []
         self.response = response
 
-    def run(self, prompt):
+    def run(self, prompt, *, model=None, reasoning_effort=None):
         self.prompts.append(prompt)
+        self.runs.append((model, reasoning_effort))
         return CodexResult(text=self.response, returncode=0, stderr="")
+
+
+class FakeModelCatalog:
+    def __init__(self):
+        self.models = (
+            ModelChoice("gpt-5.5", "GPT-5.5", ("low", "medium", "high", "xhigh"), "medium"),
+            ModelChoice("gpt-5.4-mini", "GPT-5.4-Mini", ("low", "medium", "high"), "medium"),
+        )
+
+    def list_models(self):
+        return self.models
+
+    def get_model(self, slug):
+        for model in self.models:
+            if model.slug == slug:
+                return model
+        return None
 
 
 class GatewayTests(unittest.TestCase):
@@ -73,6 +103,18 @@ class GatewayTests(unittest.TestCase):
             chat_type="private",
         )
 
+    def _callback(self, data: str, *, user_id=42) -> IncomingCallback:
+        return IncomingCallback(
+            update_id=2,
+            callback_query_id="cb1",
+            chat_id="100",
+            user_id=user_id,
+            username="nima",
+            data=data,
+            message_id=10,
+            chat_type="private",
+        )
+
     def test_help_command_does_not_run_codex(self):
         with TemporaryDirectory() as tmp:
             telegram = FakeTelegram()
@@ -81,6 +123,7 @@ class GatewayTests(unittest.TestCase):
                 settings=self._settings(Path(tmp)),
                 telegram=telegram,
                 codex=codex,
+                model_catalog=FakeModelCatalog(),
                 sessions=SessionStore(Path(tmp) / "state"),
             )
 
@@ -88,6 +131,7 @@ class GatewayTests(unittest.TestCase):
 
             self.assertEqual(len(codex.prompts), 0)
             self.assertIn("online", telegram.messages[0][1])
+            self.assertIn("/models", telegram.messages[0][1])
 
     def test_authorized_message_runs_codex_and_stores_history(self):
         with TemporaryDirectory() as tmp:
@@ -98,6 +142,7 @@ class GatewayTests(unittest.TestCase):
                 settings=self._settings(Path(tmp)),
                 telegram=telegram,
                 codex=codex,
+                model_catalog=FakeModelCatalog(),
                 sessions=store,
             )
 
@@ -105,6 +150,7 @@ class GatewayTests(unittest.TestCase):
 
             self.assertEqual(telegram.actions, ["100:typing"])
             self.assertEqual(telegram.messages[-1][1], "finished")
+            self.assertEqual(codex.runs[-1], (None, None))
             self.assertIn("Current Telegram message", codex.prompts[0])
             self.assertNotIn("User: change the repo", codex.prompts[0])
             self.assertEqual([turn.role for turn in store.load("100")], ["user", "assistant"])
@@ -118,6 +164,7 @@ class GatewayTests(unittest.TestCase):
                 settings=self._settings(Path(tmp)),
                 telegram=telegram,
                 codex=codex,
+                model_catalog=FakeModelCatalog(),
                 sessions=SessionStore(Path(tmp) / "state"),
             )
 
@@ -134,6 +181,7 @@ class GatewayTests(unittest.TestCase):
                 settings=self._settings(Path(tmp)),
                 telegram=telegram,
                 codex=codex,
+                model_catalog=FakeModelCatalog(),
                 sessions=SessionStore(Path(tmp) / "state"),
             )
 
@@ -172,6 +220,7 @@ class GatewayTests(unittest.TestCase):
                 settings=self._settings(Path(tmp)),
                 telegram=telegram,
                 codex=codex,
+                model_catalog=FakeModelCatalog(),
                 sessions=SessionStore(Path(tmp) / "state"),
             )
 
@@ -179,6 +228,70 @@ class GatewayTests(unittest.TestCase):
 
             self.assertEqual(codex.prompts, [])
             self.assertEqual(telegram.messages, [])
+
+    def test_models_command_sends_inline_model_buttons(self):
+        with TemporaryDirectory() as tmp:
+            telegram = FakeTelegram()
+            codex = FakeCodex()
+            gateway = HermesTelegramGateway(
+                settings=self._settings(Path(tmp)),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(Path(tmp) / "state"),
+            )
+
+            gateway.handle_message(self._message("/models"))
+
+            self.assertEqual(codex.prompts, [])
+            self.assertIn("Choose a Codex model", telegram.messages[0][1])
+            self.assertEqual(
+                telegram.reply_markups[0]["inline_keyboard"][0][0],
+                {"text": "GPT-5.5", "callback_data": "model:gpt-5.5"},
+            )
+
+    def test_model_callback_shows_reasoning_buttons(self):
+        with TemporaryDirectory() as tmp:
+            telegram = FakeTelegram()
+            gateway = HermesTelegramGateway(
+                settings=self._settings(Path(tmp)),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(Path(tmp) / "state"),
+            )
+
+            gateway.handle_callback(self._callback("model:gpt-5.5"))
+
+            self.assertEqual(telegram.callback_answers, [("cb1", None)])
+            self.assertIn("Choose thinking amount", telegram.edits[0][2])
+            self.assertEqual(
+                telegram.edits[0][3]["inline_keyboard"][0][-1],
+                {"text": "X High", "callback_data": "effort:gpt-5.5:xhigh"},
+            )
+
+    def test_effort_callback_saves_selection_and_next_message_uses_it(self):
+        with TemporaryDirectory() as tmp:
+            telegram = FakeTelegram()
+            codex = FakeCodex("finished")
+            store = SessionStore(Path(tmp) / "state")
+            gateway = HermesTelegramGateway(
+                settings=self._settings(Path(tmp)),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_callback(self._callback("effort:gpt-5.5:xhigh"))
+            gateway.handle_message(self._message("do the task"))
+
+            preference = store.load_model_preference("100")
+            self.assertIsNotNone(preference)
+            self.assertEqual(preference.model, "gpt-5.5")
+            self.assertEqual(preference.reasoning_effort, "xhigh")
+            self.assertEqual(codex.runs[-1], ("gpt-5.5", "xhigh"))
+            self.assertIn("Selected GPT-5.5", telegram.edits[0][2])
 
     def test_poll_once_advances_offset_when_handler_raises(self):
         with TemporaryDirectory() as tmp:
@@ -199,6 +312,7 @@ class GatewayTests(unittest.TestCase):
                 settings=self._settings(Path(tmp)),
                 telegram=telegram,
                 codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
                 sessions=SessionStore(Path(tmp) / "state"),
             )
 

@@ -19,7 +19,13 @@ class CodexRunner:
     def __init__(self, settings: Settings):
         self._settings = settings
 
-    def _build_command(self, output_path: Path) -> list[str]:
+    def _build_command(
+        self,
+        output_path: Path,
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> list[str]:
         args = [
             self._settings.codex_command,
             "exec",
@@ -31,18 +37,21 @@ class CodexRunner:
             str(output_path),
             "-",
         ]
-        if self._settings.codex_model:
-            args[2:2] = ["--model", self._settings.codex_model]
+        selected_model = model or self._settings.codex_model
+        if selected_model:
+            args[2:2] = ["--model", selected_model]
+        if reasoning_effort:
+            args[2:2] = ["-c", f'model_reasoning_effort="{reasoning_effort}"']
         if self._settings.codex_profile:
             args[2:2] = ["--profile", self._settings.codex_profile]
         if self._settings.codex_extra_args:
             args[2:2] = list(self._settings.codex_extra_args)
         return args
 
-    def run(self, prompt: str) -> CodexResult:
+    def run(self, prompt: str, *, model: str | None = None, reasoning_effort: str | None = None) -> CodexResult:
         with tempfile.TemporaryDirectory(prefix="hermes-telegram-codex-") as tmpdir:
             output_path = Path(tmpdir) / "last-message.txt"
-            command = self._build_command(output_path)
+            command = self._build_command(output_path, model=model, reasoning_effort=reasoning_effort)
             try:
                 completed = subprocess.run(
                     command,
