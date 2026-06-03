@@ -143,7 +143,7 @@ prompt_user_id_if_missing() {
 
   local value=""
   while true; do
-    printf 'Telegram numeric user ID: '
+    printf 'Telegram numeric user ID from userinfobot (https://t.me/userinfobot): '
     IFS= read -r -s value
     printf '\n'
     if [[ "$value" =~ ^-?[0-9]+([[:space:]]*,[[:space:]]*-?[0-9]+)*$ ]]; then
@@ -170,7 +170,7 @@ else
   log "Using existing local env file."
 fi
 
-prompt_secret_if_missing "TELEGRAM_BOT_TOKEN" "Telegram bot API token: "
+prompt_secret_if_missing "TELEGRAM_BOT_TOKEN" "Telegram bot API token from BotFather (https://t.me/BotFather): "
 prompt_user_id_if_missing
 
 if [ "$created_env" = "1" ]; then

@@ -18,10 +18,19 @@ This repo extracts the useful Telegram gateway shape from Hermes into a small lo
 - Ubuntu with systemd user services
 - Python 3.10+
 - Codex CLI available to the service through `CODEX_COMMAND`
-- Telegram bot token from BotFather
-- Numeric Telegram user ID for the allowed user list
+- Telegram bot token from BotFather: https://t.me/BotFather
+- Numeric Telegram user ID from userinfobot: https://t.me/userinfobot
 
 ## Install
+
+Before running the installer:
+
+1. Open BotFather at https://t.me/BotFather, create or select a bot, and copy
+   the bot API token.
+2. Open userinfobot at https://t.me/userinfobot and copy your numeric Telegram
+   user ID.
+3. Run the installer. If `.env` already contains those values, the installer
+   keeps them and does not ask again.
 
 ```bash
 cd $HOME/Desktop/hermes-telegram
@@ -110,11 +119,12 @@ those files yourself.
 
 Required:
 
-- `TELEGRAM_BOT_TOKEN`: bot token from BotFather
+- `TELEGRAM_BOT_TOKEN`: bot token from BotFather at https://t.me/BotFather
 
 Recommended:
 
-- `TELEGRAM_ALLOWED_USERS`: comma-separated numeric Telegram user IDs
+- `TELEGRAM_ALLOWED_USERS`: comma-separated numeric Telegram user IDs from
+  userinfobot at https://t.me/userinfobot
 - `TELEGRAM_ALLOWED_CHATS`: optional comma-separated chat IDs
 - `CODEX_WORKDIR`: directory where Codex should work
 
