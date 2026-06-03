@@ -76,6 +76,27 @@ ensure_env_value() {
   log "Set default $key."
 }
 
+normalize_prompt_value() {
+  local key="$1"
+  local value="$2"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  if [[ "$value" =~ ^$key[[:space:]]*=(.*)$ ]]; then
+    value="${BASH_REMATCH[1]}"
+  fi
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  value="${value%$'\r'}"
+  if [ "${#value}" -ge 2 ]; then
+    local first="${value:0:1}"
+    local last="${value: -1}"
+    if { [ "$first" = '"' ] && [ "$last" = '"' ]; } || { [ "$first" = "'" ] && [ "$last" = "'" ]; }; then
+      value="${value:1:${#value}-2}"
+    fi
+  fi
+  printf '%s\n' "$value"
+}
+
 migrate_env_value() {
   local old_key="$1"
   local new_key="$2"
@@ -141,8 +162,12 @@ prompt_secret_if_missing() {
     printf '%s' "$prompt"
     IFS= read -r -s value
     printf '\n'
+    value="$(normalize_prompt_value "$key" "$value")"
     if [ -z "$value" ]; then
       log "$key cannot be empty."
+    elif [ "$key" = "TELEGRAM_BOT_TOKEN" ] && [[ ! "$value" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
+      log "Enter only the BotFather token value, or paste a TELEGRAM_BOT_TOKEN=... line."
+      value=""
     fi
   done
   set_env_value "$key" "$value"
@@ -163,10 +188,11 @@ prompt_user_id_if_missing() {
     printf 'Telegram numeric user ID from userinfobot (https://t.me/userinfobot): '
     IFS= read -r -s value
     printf '\n'
+    value="$(normalize_prompt_value "$key" "$value")"
     if [[ "$value" =~ ^-?[0-9]+([[:space:]]*,[[:space:]]*-?[0-9]+)*$ ]]; then
       break
     fi
-    log "Enter one numeric Telegram user ID, or a comma-separated list."
+    log "Enter one numeric Telegram user ID, a comma-separated list, or paste a TELEGRAM_ALLOWED_USERS=... line."
   done
   set_env_value "$key" "$value"
   log "Saved $key."
