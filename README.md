@@ -32,6 +32,23 @@ Before running the installer:
 3. Run the installer. If `.env` already contains those values, the installer
    keeps them and does not ask again.
 
+Install from GitHub:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/nima20002000/codex-telegram/main/scripts/install-github.sh)
+```
+
+By default, the GitHub installer clones or updates the repo at
+`~/.local/share/codex-telegram`, then runs `scripts/install.sh`. To install into
+another directory:
+
+```bash
+CODEX_TELEGRAM_INSTALL_DIR="$HOME/Desktop/codex-telegram" \
+  bash <(curl -fsSL https://raw.githubusercontent.com/nima20002000/codex-telegram/main/scripts/install-github.sh)
+```
+
+Local checkout install:
+
 ```bash
 cd /home/example/codex-telegram
 bash scripts/install.sh
