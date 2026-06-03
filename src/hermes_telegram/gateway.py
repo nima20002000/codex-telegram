@@ -28,6 +28,7 @@ class GatewayStatus:
     allowed_chats: int
     model: str
     reasoning_effort: str
+    sandbox: str
 
 
 class HermesTelegramGateway:
@@ -71,6 +72,17 @@ class HermesTelegramGateway:
             self._sessions.clear_active_workspace(chat_id)
             return self._settings.codex_workdir
         return path
+
+    def _active_sandbox_mode(self, chat_id: str | None) -> str | None:
+        if chat_id is None:
+            return None
+        return self._sessions.load_sandbox_mode(chat_id)
+
+    def _sandbox_status_label(self, chat_id: str | None) -> str:
+        mode = self._active_sandbox_mode(chat_id)
+        if mode is None:
+            return f"configured ({self._settings.codex_sandbox})"
+        return mode
 
     def _child_workspaces(self, path: Path) -> list[Path]:
         root = self._settings.codex_workdir.resolve()
@@ -147,6 +159,7 @@ class HermesTelegramGateway:
                 else self._settings.codex_extra_args and "custom"
                 or "config/default"
             ),
+            sandbox=self._sandbox_status_label(chat_id),
         )
 
     def _is_authorized(self, incoming: IncomingMessage | IncomingCallback) -> bool:
@@ -161,7 +174,8 @@ class HermesTelegramGateway:
         identity = (
             f"Telegram user_id={message.user_id or 'unknown'} "
             f"username={message.username or 'unknown'} chat_id={message.chat_id} "
-            f"workspace={self._active_workdir(message.chat_id)}"
+            f"workspace={self._active_workdir(message.chat_id)} "
+            f"sandbox={self._sandbox_status_label(message.chat_id)}"
         )
         parts = [SYSTEM_PROMPT.strip(), identity]
         if history:
@@ -172,7 +186,7 @@ class HermesTelegramGateway:
     def _command_response(self, message: IncomingMessage) -> str | None:
         command = message.text.split(maxsplit=1)[0].split("@", 1)[0].lower()
         if command in {"/start", "/help"}:
-            return "/reset\n/models\n/workspace"
+            return "/reset\n/models\n/workspace\n/sandbox"
         if command == "/status":
             status = self.status(message.chat_id)
             return (
@@ -180,7 +194,8 @@ class HermesTelegramGateway:
                 f"Allowed users configured: {status.allowed_users}\n"
                 f"Allowed chats configured: {status.allowed_chats}\n"
                 f"Model: {status.model}\n"
-                f"Thinking: {status.reasoning_effort}"
+                f"Thinking: {status.reasoning_effort}\n"
+                f"Sandbox: {status.sandbox}"
             )
         if command == "/reset":
             self._sessions.reset(message.chat_id)
@@ -205,12 +220,28 @@ class HermesTelegramGateway:
         ]
         return {"inline_keyboard": [row]}
 
+    def _sandbox_keyboard(self) -> dict[str, list[list[dict[str, str]]]]:
+        return {
+            "inline_keyboard": [
+                [self._button("Constrained", "sandbox:constrained")],
+                [self._button("YOLO", "sandbox:yolo")],
+            ]
+        }
+
     def _send_model_picker(self, message: IncomingMessage) -> None:
         self._telegram.send_message(
             message.chat_id,
             "Choose a Codex model:",
             reply_to_message_id=message.message_id,
             reply_markup=self._model_keyboard(),
+        )
+
+    def _send_sandbox_picker(self, message: IncomingMessage) -> None:
+        self._telegram.send_message(
+            message.chat_id,
+            "Choose sandbox mode:",
+            reply_to_message_id=message.message_id,
+            reply_markup=self._sandbox_keyboard(),
         )
 
     def _send_workspace_browser(self, message: IncomingMessage) -> None:
@@ -230,6 +261,9 @@ class HermesTelegramGateway:
         command = message.text.split(maxsplit=1)[0].split("@", 1)[0].lower()
         if command == "/models":
             self._send_model_picker(message)
+            return
+        if command == "/sandbox":
+            self._send_sandbox_picker(message)
             return
         if command == "/workspace":
             self._send_workspace_browser(message)
@@ -256,6 +290,7 @@ class HermesTelegramGateway:
             model=preference.model if preference else None,
             reasoning_effort=preference.reasoning_effort if preference else None,
             workdir=self._active_workdir(message.chat_id),
+            sandbox_mode=self._active_sandbox_mode(message.chat_id),
         )
         response = result.text.strip()
         if len(response) > self._settings.max_telegram_response_chars:
@@ -333,10 +368,27 @@ class HermesTelegramGateway:
                 status = self.status(callback.chat_id)
                 self._reply_to_callback(
                     callback,
-                    f"Session workspace:\n{path}\n\nModel: {status.model}\nThinking: {status.reasoning_effort}",
+                    f"Session workspace:\n{path}\n\n"
+                    f"Model: {status.model}\n"
+                    f"Thinking: {status.reasoning_effort}\n"
+                    f"Sandbox: {status.sandbox}",
                 )
                 return
             self._telegram.answer_callback_query(callback.callback_query_id, text="Unknown action.")
+            return
+
+        if callback.data.startswith("sandbox:"):
+            mode = callback.data.split(":", 1)[1]
+            if mode not in {"constrained", "yolo"}:
+                self._telegram.answer_callback_query(callback.callback_query_id, text="Unknown sandbox mode.")
+                return
+            self._sessions.save_sandbox_mode(callback.chat_id, mode)
+            self._telegram.answer_callback_query(callback.callback_query_id, text="Sandbox selected.")
+            label = "YOLO" if mode == "yolo" else "Constrained"
+            self._reply_to_callback(
+                callback,
+                f"Selected sandbox: {label}\n\nSend a message to talk to the agent.",
+            )
             return
 
         if callback.data.startswith("effort:"):

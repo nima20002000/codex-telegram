@@ -120,6 +120,47 @@ class CodexRunnerTests(unittest.TestCase):
             self.assertEqual(command[command.index("-C") + 1], str(selected))
             self.assertEqual(seen["kwargs"]["cwd"], str(selected))
 
+    def test_runner_uses_constrained_sandbox_override(self):
+        with TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            seen: dict[str, object] = {}
+
+            def fake_run(command, **kwargs):
+                seen["command"] = command
+                output_path = Path(command[command.index("--output-last-message") + 1])
+                output_path.write_text("final answer", encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with patch("subprocess.run", side_effect=fake_run):
+                CodexRunner(self._settings(workdir)).run("do work", sandbox_mode="constrained")
+
+            command = seen["command"]
+            self.assertIsInstance(command, list)
+            assert isinstance(command, list)
+            self.assertIn("--sandbox", command)
+            self.assertEqual(command[command.index("--sandbox") + 1], "workspace-write")
+            self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", command)
+
+    def test_runner_uses_yolo_bypass_flag(self):
+        with TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            seen: dict[str, object] = {}
+
+            def fake_run(command, **kwargs):
+                seen["command"] = command
+                output_path = Path(command[command.index("--output-last-message") + 1])
+                output_path.write_text("final answer", encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with patch("subprocess.run", side_effect=fake_run):
+                CodexRunner(self._settings(workdir)).run("do work", sandbox_mode="yolo")
+
+            command = seen["command"]
+            self.assertIsInstance(command, list)
+            assert isinstance(command, list)
+            self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
+            self.assertNotIn("--sandbox", command)
+
 
 if __name__ == "__main__":
     unittest.main()

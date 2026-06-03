@@ -26,6 +26,7 @@ class CodexRunner:
         model: str | None = None,
         reasoning_effort: str | None = None,
         workdir: Path | None = None,
+        sandbox_mode: str | None = None,
     ) -> list[str]:
         selected_workdir = workdir or self._settings.codex_workdir
         args = [
@@ -33,12 +34,15 @@ class CodexRunner:
             "exec",
             "-C",
             str(selected_workdir),
-            "--sandbox",
-            self._settings.codex_sandbox,
             "--output-last-message",
             str(output_path),
             "-",
         ]
+        if sandbox_mode == "yolo":
+            args[2:2] = ["--dangerously-bypass-approvals-and-sandbox"]
+        else:
+            sandbox = "workspace-write" if sandbox_mode == "constrained" else self._settings.codex_sandbox
+            args[2:2] = ["--sandbox", sandbox]
         selected_model = model or self._settings.codex_model
         if selected_model:
             args[2:2] = ["--model", selected_model]
@@ -57,6 +61,7 @@ class CodexRunner:
         model: str | None = None,
         reasoning_effort: str | None = None,
         workdir: Path | None = None,
+        sandbox_mode: str | None = None,
     ) -> CodexResult:
         selected_workdir = workdir or self._settings.codex_workdir
         with tempfile.TemporaryDirectory(prefix="hermes-telegram-codex-") as tmpdir:
@@ -66,6 +71,7 @@ class CodexRunner:
                 model=model,
                 reasoning_effort=reasoning_effort,
                 workdir=selected_workdir,
+                sandbox_mode=sandbox_mode,
             )
             try:
                 completed = subprocess.run(

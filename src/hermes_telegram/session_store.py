@@ -34,6 +34,7 @@ class SessionStore:
         self._sessions_dir.mkdir(parents=True, exist_ok=True)
         self._processed_path = state_dir / "processed_messages.json"
         self._preferences_path = state_dir / "model_preferences.json"
+        self._sandbox_preferences_path = state_dir / "sandbox_preferences.json"
         self._workspaces_path = state_dir / "workspaces.json"
         self._workspace_tokens_path = state_dir / "workspace_tokens.json"
 
@@ -154,6 +155,17 @@ class SessionStore:
             return
         del preferences[chat_id]
         self._save_preferences(preferences)
+
+    def load_sandbox_mode(self, chat_id: str) -> str | None:
+        mode = self._load_string_map(self._sandbox_preferences_path).get(chat_id)
+        return mode if mode in {"constrained", "yolo"} else None
+
+    def save_sandbox_mode(self, chat_id: str, mode: str) -> None:
+        if mode not in {"constrained", "yolo"}:
+            raise ValueError(f"Unsupported sandbox mode: {mode}")
+        preferences = self._load_string_map(self._sandbox_preferences_path)
+        preferences[chat_id] = mode
+        self._save_string_map(self._sandbox_preferences_path, preferences)
 
     def _load_string_map(self, path: Path) -> dict[str, str]:
         if not path.exists():

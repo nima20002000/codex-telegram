@@ -46,12 +46,12 @@ class FakeTelegram:
 class FakeCodex:
     def __init__(self, response="done"):
         self.prompts: list[str] = []
-        self.runs: list[tuple[str | None, str | None, Path | None]] = []
+        self.runs: list[tuple[str | None, str | None, Path | None, str | None]] = []
         self.response = response
 
-    def run(self, prompt, *, model=None, reasoning_effort=None, workdir=None):
+    def run(self, prompt, *, model=None, reasoning_effort=None, workdir=None, sandbox_mode=None):
         self.prompts.append(prompt)
-        self.runs.append((model, reasoning_effort, workdir))
+        self.runs.append((model, reasoning_effort, workdir, sandbox_mode))
         return CodexResult(text=self.response, returncode=0, stderr="")
 
 
@@ -81,7 +81,13 @@ class NonAuthoritativeModelCatalog(FakeModelCatalog):
 
 
 class GatewayTests(unittest.TestCase):
-    def _settings(self, workdir: Path, *, allowed_users=frozenset({42})) -> Settings:
+    def _settings(
+        self,
+        workdir: Path,
+        *,
+        allowed_users=frozenset({42}),
+        codex_sandbox="workspace-write",
+    ) -> Settings:
         return Settings(
             bot_token="token",
             allowed_users=allowed_users,
@@ -90,7 +96,7 @@ class GatewayTests(unittest.TestCase):
             codex_workdir=workdir,
             codex_model="",
             codex_profile="",
-            codex_sandbox="workspace-write",
+            codex_sandbox=codex_sandbox,
             codex_extra_args=(),
             codex_timeout_seconds=10,
             telegram_poll_timeout_seconds=30,
@@ -138,7 +144,7 @@ class GatewayTests(unittest.TestCase):
             gateway.handle_message(self._message("/help"))
 
             self.assertEqual(len(codex.prompts), 0)
-            self.assertEqual(telegram.messages[0][1], "/reset\n/models\n/workspace")
+            self.assertEqual(telegram.messages[0][1], "/reset\n/models\n/workspace\n/sandbox")
 
     def test_status_command_shows_status(self):
         with TemporaryDirectory() as tmp:
@@ -157,6 +163,7 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(len(codex.prompts), 0)
             self.assertIn(f"Workspace: {Path(tmp).resolve()}", telegram.messages[0][1])
             self.assertIn("Model: default", telegram.messages[0][1])
+            self.assertIn("Sandbox: configured (workspace-write)", telegram.messages[0][1])
 
     def test_workspace_command_shows_folder_buttons(self):
         with TemporaryDirectory() as tmp:
@@ -279,7 +286,8 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(preference.reasoning_effort, "xhigh")
             self.assertIn(f"Session workspace:\n{avatar.resolve()}", telegram.edits[1][2])
             self.assertIn("Model: gpt-5.5", telegram.edits[1][2])
-            self.assertEqual(codex.runs[-1], ("gpt-5.5", "xhigh", avatar.resolve()))
+            self.assertIn("Sandbox: configured (workspace-write)", telegram.edits[1][2])
+            self.assertEqual(codex.runs[-1], ("gpt-5.5", "xhigh", avatar.resolve(), None))
             self.assertNotIn("old context", codex.prompts[-1])
 
     def test_reset_command_keeps_selected_model_default(self):
@@ -306,8 +314,97 @@ class GatewayTests(unittest.TestCase):
             assert preference is not None
             self.assertEqual(preference.model, "gpt-5.5")
             self.assertEqual(preference.reasoning_effort, "xhigh")
-            self.assertEqual(codex.runs[-1], ("gpt-5.5", "xhigh", root.resolve()))
+            self.assertEqual(codex.runs[-1], ("gpt-5.5", "xhigh", root.resolve(), None))
             self.assertNotIn("old context", codex.prompts[-1])
+
+    def test_sandbox_command_sends_mode_buttons(self):
+        with TemporaryDirectory() as tmp:
+            telegram = FakeTelegram()
+            codex = FakeCodex()
+            gateway = HermesTelegramGateway(
+                settings=self._settings(Path(tmp)),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(Path(tmp) / "state"),
+            )
+
+            gateway.handle_message(self._message("/sandbox"))
+
+            self.assertEqual(codex.prompts, [])
+            self.assertEqual(telegram.messages[0][1], "Choose sandbox mode:")
+            self.assertEqual(
+                telegram.reply_markups[0]["inline_keyboard"],
+                [
+                    [{"text": "Constrained", "callback_data": "sandbox:constrained"}],
+                    [{"text": "YOLO", "callback_data": "sandbox:yolo"}],
+                ],
+            )
+
+    def test_sandbox_callback_saves_default_for_next_message(self):
+        with TemporaryDirectory() as tmp:
+            telegram = FakeTelegram()
+            codex = FakeCodex("finished")
+            store = SessionStore(Path(tmp) / "state")
+            gateway = HermesTelegramGateway(
+                settings=self._settings(Path(tmp)),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_callback(self._callback("sandbox:yolo"))
+            gateway.handle_message(self._message("do the task"))
+
+            self.assertEqual(store.load_sandbox_mode("100"), "yolo")
+            self.assertEqual(telegram.callback_answers, [("cb1", "Sandbox selected.")])
+            self.assertIn("Selected sandbox: YOLO", telegram.edits[0][2])
+            self.assertEqual(codex.runs[-1], (None, None, Path(tmp).resolve(), "yolo"))
+
+    def test_reset_command_keeps_selected_sandbox_default(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex()
+            store = SessionStore(root / ".state")
+            store.save_sandbox_mode("100", "yolo")
+            store.append("100", "user", "old context")
+            gateway = HermesTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("/reset"))
+            gateway.handle_message(self._message("do the task"))
+
+            self.assertEqual(store.load_sandbox_mode("100"), "yolo")
+            self.assertEqual(codex.runs[-1], (None, None, root.resolve(), "yolo"))
+            self.assertNotIn("old context", codex.prompts[-1])
+
+    def test_unset_sandbox_preserves_configured_read_only_sandbox(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex()
+            store = SessionStore(root / ".state")
+            gateway = HermesTelegramGateway(
+                settings=self._settings(root, codex_sandbox="read-only"),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("do the task"))
+            gateway.handle_message(self._message("/status"))
+
+            self.assertIsNone(store.load_sandbox_mode("100"))
+            self.assertEqual(codex.runs[-1], (None, None, root.resolve(), None))
+            self.assertIn("Sandbox: configured (read-only)", telegram.messages[-1][1])
 
     def test_workspace_callback_rejects_path_escape(self):
         with TemporaryDirectory() as tmp:
@@ -345,7 +442,7 @@ class GatewayTests(unittest.TestCase):
 
             self.assertEqual(telegram.actions, ["100:typing"])
             self.assertEqual(telegram.messages[-1][1], "finished")
-            self.assertEqual(codex.runs[-1], (None, None, Path(tmp).resolve()))
+            self.assertEqual(codex.runs[-1], (None, None, Path(tmp).resolve(), None))
             self.assertIn("Current Telegram message", codex.prompts[0])
             self.assertNotIn("User: change the repo", codex.prompts[0])
             self.assertEqual([turn.role for turn in store.load("100")], ["user", "assistant"])
@@ -485,7 +582,7 @@ class GatewayTests(unittest.TestCase):
             self.assertIsNotNone(preference)
             self.assertEqual(preference.model, "gpt-5.5")
             self.assertEqual(preference.reasoning_effort, "xhigh")
-            self.assertEqual(codex.runs[-1], ("gpt-5.5", "xhigh", Path(tmp).resolve()))
+            self.assertEqual(codex.runs[-1], ("gpt-5.5", "xhigh", Path(tmp).resolve(), None))
             self.assertIn("Selected GPT-5.5", telegram.edits[0][2])
 
     def test_unavailable_saved_model_is_ignored_and_cleared(self):
@@ -504,7 +601,7 @@ class GatewayTests(unittest.TestCase):
 
             gateway.handle_message(self._message("do the task"))
 
-            self.assertEqual(codex.runs[-1], (None, None, Path(tmp).resolve()))
+            self.assertEqual(codex.runs[-1], (None, None, Path(tmp).resolve(), None))
             self.assertIsNone(store.load_model_preference("100"))
 
     def test_saved_model_is_kept_when_catalog_is_not_authoritative(self):
@@ -523,7 +620,7 @@ class GatewayTests(unittest.TestCase):
 
             gateway.handle_message(self._message("do the task"))
 
-            self.assertEqual(codex.runs[-1], ("gpt-5.2", "medium", Path(tmp).resolve()))
+            self.assertEqual(codex.runs[-1], ("gpt-5.2", "medium", Path(tmp).resolve(), None))
             self.assertIsNotNone(store.load_model_preference("100"))
 
     def test_poll_once_advances_offset_when_handler_raises(self):

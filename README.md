@@ -61,6 +61,7 @@ the process exits.
 - `/reset`
 - `/models`
 - `/workspace`
+- `/sandbox`
 
 Any other text message is sent to `codex exec`.
 
@@ -73,6 +74,12 @@ Model choices come from the local `codex debug models` catalog when available.
 The selected model and thinking amount are stored per Telegram chat under the
 bridge state directory and are applied to later agent messages from that chat,
 including new workspace sessions after `/reset`.
+
+`/sandbox` lets a chat choose between `Constrained` and `YOLO`. Constrained runs
+Codex with `--sandbox workspace-write`. YOLO runs Codex with
+`--dangerously-bypass-approvals-and-sandbox`, which disables approval prompts and
+sandboxing. The selected sandbox mode is stored per Telegram chat and stays in
+effect for later messages and sessions.
 
 ## Environment
 

@@ -92,6 +92,7 @@ class TelegramAPITests(unittest.TestCase):
                 ("/reset", "Reset"),
                 ("/models", "Models"),
                 ("/workspace", "Workspace"),
+                ("/sandbox", "Sandbox"),
             ]
         )
 
@@ -105,6 +106,7 @@ class TelegramAPITests(unittest.TestCase):
                             {"command": "reset", "description": "Reset"},
                             {"command": "models", "description": "Models"},
                             {"command": "workspace", "description": "Workspace"},
+                            {"command": "sandbox", "description": "Sandbox"},
                         ]
                     },
                 )

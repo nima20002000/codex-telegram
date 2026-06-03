@@ -15,6 +15,7 @@ BOT_COMMANDS = [
     ("/reset", "Reset"),
     ("/models", "Models"),
     ("/workspace", "Workspace"),
+    ("/sandbox", "Sandbox"),
 ]
 
 

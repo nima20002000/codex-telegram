@@ -57,6 +57,23 @@ class SessionStoreTests(unittest.TestCase):
             store.clear_active_workspace("chat")
             self.assertEqual(store.load_active_workspace("chat"), "")
 
+    def test_sandbox_mode_round_trip(self):
+        with TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+
+            self.assertIsNone(store.load_sandbox_mode("chat"))
+            store.save_sandbox_mode("chat", "yolo")
+            self.assertEqual(store.load_sandbox_mode("chat"), "yolo")
+            store.save_sandbox_mode("chat", "constrained")
+            self.assertEqual(store.load_sandbox_mode("chat"), "constrained")
+
+    def test_sandbox_mode_rejects_unknown_value(self):
+        with TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+
+            with self.assertRaisesRegex(ValueError, "Unsupported sandbox mode"):
+                store.save_sandbox_mode("chat", "danger-full-access")
+
     def test_workspace_token_round_trip(self):
         with TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp))
