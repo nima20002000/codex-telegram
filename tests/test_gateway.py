@@ -4,12 +4,12 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from hermes_telegram.codex_runner import CodexResult
-from hermes_telegram.config import Settings
-from hermes_telegram.gateway import HermesTelegramGateway
-from hermes_telegram.model_catalog import ModelChoice
-from hermes_telegram.session_store import SessionStore
-from hermes_telegram.telegram_api import IncomingCallback, IncomingMessage
+from codex_telegram.codex_runner import CodexResult
+from codex_telegram.config import Settings
+from codex_telegram.gateway import CodexTelegramGateway
+from codex_telegram.model_catalog import ModelChoice
+from codex_telegram.session_store import SessionStore
+from codex_telegram.telegram_api import IncomingCallback, IncomingMessage
 
 
 class FakeTelegram:
@@ -133,7 +133,7 @@ class GatewayTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             telegram = FakeTelegram()
             codex = FakeCodex()
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(Path(tmp)),
                 telegram=telegram,
                 codex=codex,
@@ -150,7 +150,7 @@ class GatewayTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             telegram = FakeTelegram()
             codex = FakeCodex()
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(Path(tmp)),
                 telegram=telegram,
                 codex=codex,
@@ -172,7 +172,7 @@ class GatewayTests(unittest.TestCase):
             (root / "beta").mkdir()
             telegram = FakeTelegram()
             codex = FakeCodex()
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
                 codex=codex,
@@ -195,7 +195,7 @@ class GatewayTests(unittest.TestCase):
             store = SessionStore(root / ".state")
             store.save_active_workspace("100", "avatar")
             telegram = FakeTelegram()
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
                 codex=FakeCodex(),
@@ -217,7 +217,7 @@ class GatewayTests(unittest.TestCase):
             external.mkdir()
             (root / "outside").symlink_to(external, target_is_directory=True)
             telegram = FakeTelegram()
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
                 codex=FakeCodex(),
@@ -237,7 +237,7 @@ class GatewayTests(unittest.TestCase):
             avatar.mkdir()
             (avatar / "child").mkdir()
             telegram = FakeTelegram()
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
                 codex=FakeCodex(),
@@ -263,7 +263,7 @@ class GatewayTests(unittest.TestCase):
             store = SessionStore(root / ".state")
             store.save_model_preference("100", model="gpt-5.5", reasoning_effort="xhigh")
             store.append("100", "user", "old context")
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
                 codex=codex,
@@ -298,7 +298,7 @@ class GatewayTests(unittest.TestCase):
             store = SessionStore(root / ".state")
             store.save_model_preference("100", model="gpt-5.5", reasoning_effort="xhigh")
             store.append("100", "user", "old context")
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
                 codex=codex,
@@ -321,7 +321,7 @@ class GatewayTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             telegram = FakeTelegram()
             codex = FakeCodex()
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(Path(tmp)),
                 telegram=telegram,
                 codex=codex,
@@ -346,7 +346,7 @@ class GatewayTests(unittest.TestCase):
             telegram = FakeTelegram()
             codex = FakeCodex("finished")
             store = SessionStore(Path(tmp) / "state")
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(Path(tmp)),
                 telegram=telegram,
                 codex=codex,
@@ -370,7 +370,7 @@ class GatewayTests(unittest.TestCase):
             store = SessionStore(root / ".state")
             store.save_sandbox_mode("100", "yolo")
             store.append("100", "user", "old context")
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
                 codex=codex,
@@ -391,7 +391,7 @@ class GatewayTests(unittest.TestCase):
             telegram = FakeTelegram()
             codex = FakeCodex()
             store = SessionStore(root / ".state")
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(root, codex_sandbox="read-only"),
                 telegram=telegram,
                 codex=codex,
@@ -412,7 +412,7 @@ class GatewayTests(unittest.TestCase):
             telegram = FakeTelegram()
             store = SessionStore(root / ".state")
             token = store.remember_workspace_token("..")
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
                 codex=FakeCodex(),
@@ -430,7 +430,7 @@ class GatewayTests(unittest.TestCase):
             telegram = FakeTelegram()
             codex = FakeCodex("finished")
             store = SessionStore(Path(tmp) / "state")
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(Path(tmp)),
                 telegram=telegram,
                 codex=codex,
@@ -452,7 +452,7 @@ class GatewayTests(unittest.TestCase):
             telegram = FakeTelegram()
             telegram.fail_chat_action = True
             codex = FakeCodex("finished")
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(Path(tmp)),
                 telegram=telegram,
                 codex=codex,
@@ -469,7 +469,7 @@ class GatewayTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             telegram = FakeTelegram()
             codex = FakeCodex("finished")
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(Path(tmp)),
                 telegram=telegram,
                 codex=codex,
@@ -508,7 +508,7 @@ class GatewayTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             telegram = FakeTelegram()
             codex = FakeCodex()
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(Path(tmp)),
                 telegram=telegram,
                 codex=codex,
@@ -525,7 +525,7 @@ class GatewayTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             telegram = FakeTelegram()
             codex = FakeCodex()
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(Path(tmp)),
                 telegram=telegram,
                 codex=codex,
@@ -545,7 +545,7 @@ class GatewayTests(unittest.TestCase):
     def test_model_callback_shows_reasoning_buttons(self):
         with TemporaryDirectory() as tmp:
             telegram = FakeTelegram()
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(Path(tmp)),
                 telegram=telegram,
                 codex=FakeCodex(),
@@ -567,7 +567,7 @@ class GatewayTests(unittest.TestCase):
             telegram = FakeTelegram()
             codex = FakeCodex("finished")
             store = SessionStore(Path(tmp) / "state")
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(Path(tmp)),
                 telegram=telegram,
                 codex=codex,
@@ -591,7 +591,7 @@ class GatewayTests(unittest.TestCase):
             codex = FakeCodex("finished")
             store = SessionStore(Path(tmp) / "state")
             store.save_model_preference("100", model="gpt-5.2", reasoning_effort="medium")
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(Path(tmp)),
                 telegram=telegram,
                 codex=codex,
@@ -610,7 +610,7 @@ class GatewayTests(unittest.TestCase):
             codex = FakeCodex("finished")
             store = SessionStore(Path(tmp) / "state")
             store.save_model_preference("100", model="gpt-5.2", reasoning_effort="medium")
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(Path(tmp)),
                 telegram=telegram,
                 codex=codex,
@@ -638,7 +638,7 @@ class GatewayTests(unittest.TestCase):
                     }
                 ]
             )
-            gateway = HermesTelegramGateway(
+            gateway = CodexTelegramGateway(
                 settings=self._settings(Path(tmp)),
                 telegram=telegram,
                 codex=FakeCodex(),

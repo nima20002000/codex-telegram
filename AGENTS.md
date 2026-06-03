@@ -3,20 +3,20 @@
 ## Project Structure & Module Organization
 
 This is a small Python package for running Codex through a Telegram bot bridge.
-Application code lives in `src/hermes_telegram/`:
+Application code lives in `src/codex_telegram/`:
 
 - `cli.py` wires configuration, Telegram polling, Codex execution, and session storage.
 - `config.py` parses `.env` settings and validates runtime paths.
 - `gateway.py` handles Telegram commands, authorization, model selection, and message flow.
 - `codex_runner.py`, `telegram_api.py`, `session_store.py`, and `model_catalog.py` isolate external process, API, state, and model-catalog behavior.
 
-Tests live in `tests/` and mirror the module responsibilities. Deployment assets are under `deploy/systemd/`. Runtime files such as `.env` and `.hermes-telegram/` are local-only and should not be committed.
+Tests live in `tests/` and mirror the module responsibilities. Deployment assets are under `deploy/systemd/`. Runtime files such as `.env` and `.codex-telegram/` are local-only and should not be committed.
 
 ## Build, Test, and Development Commands
 
-- `PYTHONPATH=src python3 -m hermes_telegram.cli --env-file .env`: run the bridge directly from the checkout.
+- `PYTHONPATH=src python3 -m codex_telegram.cli --env-file .env`: run the bridge directly from the checkout.
 - `python3 -m pip install -e .`: install the package in editable mode.
-- `hermes-telegram --env-file .env`: run via the console script after editable install.
+- `codex-telegram --env-file .env`: run via the console script after editable install.
 - `PYTHONPATH=src python3 -m unittest discover -s tests`: run the full test suite.
 - `python3 -m build`: build a package artifact if the `build` module is installed.
 
@@ -34,4 +34,4 @@ Recent commits use short imperative subjects, for example `Add Telegram model pi
 
 ## Security & Configuration Tips
 
-Never commit bot tokens, user IDs from private chats, `.env`, or `.hermes-telegram/` state. When editing systemd service files, keep absolute paths and `CODEX_COMMAND` behavior clear because user services may not inherit shell-managed paths.
+Never commit bot tokens, user IDs from private chats, `.env`, or `.codex-telegram/` state. When editing systemd service files, keep absolute paths and `CODEX_COMMAND` behavior clear because user services may not inherit shell-managed paths.

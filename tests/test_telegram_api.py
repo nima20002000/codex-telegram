@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from hermes_telegram.telegram_api import TelegramAPI, parse_callback_update, parse_message_update, split_telegram_text
+from codex_telegram.telegram_api import TelegramAPI, parse_callback_update, parse_message_update, split_telegram_text
 
 
 class RecordingTelegramAPI(TelegramAPI):

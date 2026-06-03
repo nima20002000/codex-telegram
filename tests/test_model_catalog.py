@@ -5,7 +5,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from hermes_telegram.model_catalog import CodexModelCatalog
+from codex_telegram.model_catalog import CodexModelCatalog
 
 
 def _models_payload(*slugs: str) -> str:

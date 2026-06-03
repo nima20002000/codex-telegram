@@ -64,7 +64,7 @@ class CodexRunner:
         sandbox_mode: str | None = None,
     ) -> CodexResult:
         selected_workdir = workdir or self._settings.codex_workdir
-        with tempfile.TemporaryDirectory(prefix="hermes-telegram-codex-") as tmpdir:
+        with tempfile.TemporaryDirectory(prefix="codex-telegram-codex-") as tmpdir:
             output_path = Path(tmpdir) / "last-message.txt"
             command = self._build_command(
                 output_path,

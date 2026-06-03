@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from hermes_telegram.config import Settings, load_env_file
+from codex_telegram.config import Settings, load_env_file
 
 
 class ConfigTests(unittest.TestCase):
@@ -56,6 +56,22 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(settings.bot_token, "env-token")
             self.assertEqual(settings.allowed_users, frozenset({123, 456}))
             self.assertEqual(settings.codex_workdir, workdir.resolve())
+
+    def test_legacy_state_dir_env_var_is_used_as_fallback(self):
+        with TemporaryDirectory() as tmp:
+            workdir = Path(tmp) / "repo"
+            state_dir = Path(tmp) / "state"
+            workdir.mkdir()
+
+            settings = Settings.from_env(
+                environ={
+                    "TELEGRAM_BOT_TOKEN": "token",
+                    "CODEX_WORKDIR": str(workdir),
+                    "HERMES_TELEGRAM_STATE_DIR": str(state_dir),
+                }
+            )
+
+            self.assertEqual(settings.state_dir, state_dir.resolve())
 
     def test_settings_requires_token(self):
         with self.assertRaisesRegex(ValueError, "TELEGRAM_BOT_TOKEN"):

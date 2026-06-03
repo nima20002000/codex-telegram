@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from hermes_telegram.session_store import SessionStore
+from codex_telegram.session_store import SessionStore
 
 
 class SessionStoreTests(unittest.TestCase):

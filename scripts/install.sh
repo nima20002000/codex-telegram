@@ -2,9 +2,9 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-env_file="${HERMES_TELEGRAM_ENV_FILE:-"$repo_root/.env"}"
-service_name="${HERMES_TELEGRAM_SERVICE_NAME:-hermes-telegram.service}"
-skip_systemd="${HERMES_TELEGRAM_SKIP_SYSTEMD:-0}"
+env_file="${CODEX_TELEGRAM_ENV_FILE:-"$repo_root/.env"}"
+service_name="${CODEX_TELEGRAM_SERVICE_NAME:-codex-telegram.service}"
+skip_systemd="${CODEX_TELEGRAM_SKIP_SYSTEMD:-0}"
 service_python="/usr/bin/python3"
 created_env="0"
 
@@ -74,6 +74,23 @@ ensure_env_value() {
   fi
   set_env_value "$key" "$default_value"
   log "Set default $key."
+}
+
+migrate_env_value() {
+  local old_key="$1"
+  local new_key="$2"
+  local current_new
+  local current_old
+  current_new="$(env_value "$new_key" || true)"
+  if [ -n "$current_new" ]; then
+    return
+  fi
+  current_old="$(env_value "$old_key" || true)"
+  if [ -z "$current_old" ]; then
+    return
+  fi
+  set_env_value "$new_key" "$current_old"
+  log "Migrated legacy $new_key."
 }
 
 resolve_codex_command() {
@@ -172,15 +189,16 @@ fi
 
 prompt_secret_if_missing "TELEGRAM_BOT_TOKEN" "Telegram bot API token from BotFather (https://t.me/BotFather): "
 prompt_user_id_if_missing
+migrate_env_value "HERMES_TELEGRAM_STATE_DIR" "CODEX_TELEGRAM_STATE_DIR"
 
 if [ "$created_env" = "1" ]; then
   set_env_value "CODEX_WORKDIR" "$HOME/Desktop"
   log "Set default CODEX_WORKDIR."
-  set_env_value "HERMES_TELEGRAM_STATE_DIR" "$repo_root/.hermes-telegram"
-  log "Set default HERMES_TELEGRAM_STATE_DIR."
+  set_env_value "CODEX_TELEGRAM_STATE_DIR" "$repo_root/.codex-telegram"
+  log "Set default CODEX_TELEGRAM_STATE_DIR."
 else
   ensure_env_value "CODEX_WORKDIR" "$HOME/Desktop"
-  ensure_env_value "HERMES_TELEGRAM_STATE_DIR" "$repo_root/.hermes-telegram"
+  ensure_env_value "CODEX_TELEGRAM_STATE_DIR" "$repo_root/.codex-telegram"
 fi
 ensure_codex_command
 ensure_env_value "CODEX_SANDBOX" "workspace-write"
@@ -202,16 +220,28 @@ else
 fi
 
 if [ "$skip_systemd" = "1" ]; then
-  log "Skipping systemd setup because HERMES_TELEGRAM_SKIP_SYSTEMD=1."
+  log "Skipping systemd setup because CODEX_TELEGRAM_SKIP_SYSTEMD=1."
   exit 0
 fi
 
 service_dir="$HOME/.config/systemd/user"
 service_file="$service_dir/$service_name"
 mkdir -p "$service_dir"
+for existing_service_file in "$service_dir"/*-telegram.service; do
+  [ -e "$existing_service_file" ] || continue
+  existing_service="$(basename "$existing_service_file")"
+  if [ "$existing_service" = "$service_name" ]; then
+    continue
+  fi
+  if grep -Eq 'Telegram Codex bridge|_telegram\.cli' "$existing_service_file"; then
+    systemctl --user disable --now "$existing_service" >/dev/null 2>&1 || true
+    rm -f "$existing_service_file"
+    log "Removed previous Telegram Codex bridge service: $existing_service."
+  fi
+done
 cat >"$service_file" <<EOF
 [Unit]
-Description=Hermes Telegram Codex bridge
+Description=Codex Telegram bridge
 After=network-online.target
 Wants=network-online.target
 
@@ -219,7 +249,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$repo_root
 Environment=PYTHONPATH=$repo_root/src
-ExecStart=$service_python -m hermes_telegram.cli --env-file $env_file
+ExecStart=$service_python -m codex_telegram.cli --env-file $env_file
 Restart=on-failure
 RestartSec=5
 

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .codex_runner import CodexRunner
 from .config import Settings
-from .gateway import HermesTelegramGateway
+from .gateway import CodexTelegramGateway
 from .session_store import SessionStore
 from .telegram_api import TelegramAPI, TelegramAPIError
 
@@ -20,7 +20,7 @@ BOT_COMMANDS = [
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the standalone Hermes Telegram bridge.")
+    parser = argparse.ArgumentParser(description="Run the standalone Codex Telegram bridge.")
     parser.add_argument("--env-file", default=".env", help="Path to env file. Default: .env")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
     return parser
@@ -44,7 +44,7 @@ def main(argv: list[str] | None = None) -> int:
     except TelegramAPIError:
         logging.warning("Failed to update Telegram bot commands", exc_info=True)
 
-    gateway = HermesTelegramGateway(
+    gateway = CodexTelegramGateway(
         settings=settings,
         telegram=telegram,
         codex=CodexRunner(settings),

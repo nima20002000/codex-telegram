@@ -31,7 +31,7 @@ class GatewayStatus:
     sandbox: str
 
 
-class HermesTelegramGateway:
+class CodexTelegramGateway:
     def __init__(
         self,
         *,

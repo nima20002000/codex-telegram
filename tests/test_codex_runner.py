@@ -6,8 +6,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from hermes_telegram.codex_runner import CodexRunner
-from hermes_telegram.config import Settings
+from codex_telegram.codex_runner import CodexRunner
+from codex_telegram.config import Settings
 
 
 class CodexRunnerTests(unittest.TestCase):

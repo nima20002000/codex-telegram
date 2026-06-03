@@ -93,7 +93,11 @@ class Settings:
         workdir = Path(env.get("CODEX_WORKDIR", "").strip() or default_workdir or Path.cwd())
         workdir = workdir.expanduser().resolve()
 
-        state_dir = Path(env.get("HERMES_TELEGRAM_STATE_DIR", "").strip() or workdir / ".hermes-telegram")
+        state_dir_value = (
+            env.get("CODEX_TELEGRAM_STATE_DIR", "").strip()
+            or env.get("HERMES_TELEGRAM_STATE_DIR", "").strip()
+        )
+        state_dir = Path(state_dir_value or workdir / ".codex-telegram")
         state_dir = state_dir.expanduser().resolve()
 
         return cls(

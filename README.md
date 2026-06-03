@@ -1,15 +1,15 @@
-# Hermes Telegram
+# Codex Telegram
 
 MIT-licensed local Telegram bridge for running Codex from a bot chat.
 
 This tool has only been tested on Ubuntu with the Codex CLI.
 
-This repo extracts the useful Telegram gateway shape from Hermes into a small local service:
+This repo provides a small local Telegram service for driving Codex:
 
 - reads a Telegram bot token from `.env`
 - polls Telegram Bot API with `getUpdates`
 - gates access by Telegram user IDs and/or chat IDs
-- keeps compact per-chat local history under `.hermes-telegram/`
+- keeps compact per-chat local history under `.codex-telegram/`
 - runs `codex exec` in the configured local workspace
 - replies to Telegram with the final Codex response
 
@@ -33,7 +33,7 @@ Before running the installer:
    keeps them and does not ask again.
 
 ```bash
-cd $HOME/Desktop/hermes-telegram
+cd /home/example/codex-telegram
 bash scripts/install.sh
 ```
 
@@ -45,19 +45,19 @@ The installer:
 - preserves existing `.env` values, including bot token, allowed users, Codex command, sandbox, and workdir
 - resolves `codex` to an absolute `CODEX_COMMAND` path for newly created env files
 - prompts only for missing `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USERS`
-- installs and restarts the user service at `~/.config/systemd/user/hermes-telegram.service`
+- installs and restarts the user service at `~/.config/systemd/user/codex-telegram.service`
 - enables linger so the user service can run after reboot without an interactive login
 
 For a one-off foreground run without systemd:
 
 ```bash
-PYTHONPATH=src python3 -m hermes_telegram.cli --env-file .env
+PYTHONPATH=src python3 -m codex_telegram.cli --env-file .env
 ```
 
 Or after installation:
 
 ```bash
-hermes-telegram --env-file .env
+codex-telegram --env-file .env
 ```
 
 ## Verify
@@ -65,8 +65,8 @@ hermes-telegram --env-file .env
 Check service state and recent logs:
 
 ```bash
-systemctl --user status hermes-telegram.service --no-pager
-journalctl --user -u hermes-telegram.service --since '2 minutes ago' --no-pager
+systemctl --user status codex-telegram.service --no-pager
+journalctl --user -u codex-telegram.service --since '2 minutes ago' --no-pager
 ```
 
 From the allowed Telegram user, send `/status`, `/models`, `/workspace`, and
@@ -103,16 +103,16 @@ effect for later messages and sessions.
 Disable the service:
 
 ```bash
-systemctl --user disable --now hermes-telegram.service
+systemctl --user disable --now codex-telegram.service
 ```
 
 Remove the package installation from the active Python environment:
 
 ```bash
-python3 -m pip uninstall hermes-telegram
+python3 -m pip uninstall codex-telegram
 ```
 
-Local runtime state remains in `.env` and `.hermes-telegram/` unless you remove
+Local runtime state remains in `.env` and `.codex-telegram/` unless you remove
 those files yourself.
 
 ## Environment
@@ -146,12 +146,12 @@ Telegram options:
 Bridge options:
 
 - `SESSION_HISTORY_TURNS`: defaults to `8`
-- `HERMES_TELEGRAM_STATE_DIR`: defaults to `$CODEX_WORKDIR/.hermes-telegram`
+- `CODEX_TELEGRAM_STATE_DIR`: defaults to `$CODEX_WORKDIR/.codex-telegram`
 
 ## Security
 
 `.env` is local secret state and must not be committed. It contains the Telegram
-bot token and allowed user IDs. The repository ignores `.env`, `.hermes-telegram/`,
+bot token and allowed user IDs. The repository ignores `.env`, `.codex-telegram/`,
 Python caches, build output, and local backup files. Do not paste bot tokens or
 Telegram user IDs into issues, logs, commits, or documentation.
 
@@ -167,4 +167,4 @@ PYTHONPATH=src python3 -m unittest discover -s tests
 
 ## Notes
 
-This bridge intentionally does not vendor the full `~/.hermes/hermes-agent` codebase. It extracts the Telegram-to-agent control path into a focused local repo. The agent side is Codex CLI, so the bot can work in whatever `CODEX_WORKDIR` points at.
+This bridge keeps the Telegram-to-Codex control path in a focused local repo. The agent side is Codex CLI, so the bot can work in whatever `CODEX_WORKDIR` points at.

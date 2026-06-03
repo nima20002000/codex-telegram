@@ -3,7 +3,7 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hermes-telegram"
+name = "codex-telegram"
 version = "0.1.0"
 description = "Standalone Telegram bridge for driving Codex from a bot chat."
 readme = "README.md"
@@ -13,7 +13,7 @@ authors = [{ name = "Local" }]
 dependencies = []
 
 [project.scripts]
-hermes-telegram = "hermes_telegram.cli:main"
+codex-telegram = "codex_telegram.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,0 +1,15 @@
+[Unit]
+Description=Codex Telegram Codex bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Desktop/codex-telegram
+Environment=PYTHONPATH=%h/Desktop/codex-telegram/src
+ExecStart=/usr/bin/python3 -m codex_telegram.cli --env-file %h/Desktop/codex-telegram/.env
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
