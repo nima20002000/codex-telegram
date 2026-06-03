@@ -246,7 +246,7 @@ class GatewayTests(unittest.TestCase):
             keyboard = telegram.edits[0][3]["inline_keyboard"]
             self.assertEqual([row[0]["text"] for row in keyboard], ["Start session", "child", "Back"])
 
-    def test_start_workspace_session_sets_workdir_and_default_model(self):
+    def test_start_workspace_session_keeps_selected_model_default(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             avatar = root / "avatar"
@@ -272,9 +272,41 @@ class GatewayTests(unittest.TestCase):
             gateway.handle_message(self._message("do the task"))
 
             self.assertEqual(store.load_active_workspace("100"), "avatar")
-            self.assertIsNone(store.load_model_preference("100"))
+            preference = store.load_model_preference("100")
+            self.assertIsNotNone(preference)
+            assert preference is not None
+            self.assertEqual(preference.model, "gpt-5.5")
+            self.assertEqual(preference.reasoning_effort, "xhigh")
             self.assertIn(f"Session workspace:\n{avatar.resolve()}", telegram.edits[1][2])
-            self.assertEqual(codex.runs[-1], (None, None, avatar.resolve()))
+            self.assertIn("Model: gpt-5.5", telegram.edits[1][2])
+            self.assertEqual(codex.runs[-1], ("gpt-5.5", "xhigh", avatar.resolve()))
+            self.assertNotIn("old context", codex.prompts[-1])
+
+    def test_reset_command_keeps_selected_model_default(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex()
+            store = SessionStore(root / ".state")
+            store.save_model_preference("100", model="gpt-5.5", reasoning_effort="xhigh")
+            store.append("100", "user", "old context")
+            gateway = HermesTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("/reset"))
+            gateway.handle_message(self._message("do the task"))
+
+            preference = store.load_model_preference("100")
+            self.assertIsNotNone(preference)
+            assert preference is not None
+            self.assertEqual(preference.model, "gpt-5.5")
+            self.assertEqual(preference.reasoning_effort, "xhigh")
+            self.assertEqual(codex.runs[-1], ("gpt-5.5", "xhigh", root.resolve()))
             self.assertNotIn("old context", codex.prompts[-1])
 
     def test_workspace_callback_rejects_path_escape(self):

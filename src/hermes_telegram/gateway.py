@@ -329,9 +329,12 @@ class HermesTelegramGateway:
             if action == "s":
                 self._sessions.save_active_workspace(callback.chat_id, self._workspace_relative_path(path))
                 self._sessions.reset(callback.chat_id)
-                self._sessions.clear_model_preference(callback.chat_id)
                 self._telegram.answer_callback_query(callback.callback_query_id, text="Session started.")
-                self._reply_to_callback(callback, f"Session workspace:\n{path}\n\nModel: default")
+                status = self.status(callback.chat_id)
+                self._reply_to_callback(
+                    callback,
+                    f"Session workspace:\n{path}\n\nModel: {status.model}\nThinking: {status.reasoning_effort}",
+                )
                 return
             self._telegram.answer_callback_query(callback.callback_query_id, text="Unknown action.")
             return

@@ -66,12 +66,13 @@ Any other text message is sent to `codex exec`.
 
 `/workspace` opens an inline folder browser rooted at `CODEX_WORKDIR`. Use folder
 buttons to move into child directories, then press `Start session` to make later
-messages run in that directory with the default model. The selected workspace is
-stored per Telegram chat.
+messages run in that directory. The selected workspace is stored per Telegram
+chat.
 
 Model choices come from the local `codex debug models` catalog when available.
 The selected model and thinking amount are stored per Telegram chat under the
-bridge state directory and are applied to later agent messages from that chat.
+bridge state directory and are applied to later agent messages from that chat,
+including new workspace sessions after `/reset`.
 
 ## Environment
 
