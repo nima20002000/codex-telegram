@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import unittest
 
-from hermes_telegram.telegram_api import parse_callback_update, parse_message_update, split_telegram_text
+from hermes_telegram.telegram_api import TelegramAPI, parse_callback_update, parse_message_update, split_telegram_text
+
+
+class RecordingTelegramAPI(TelegramAPI):
+    def __init__(self):
+        super().__init__("token")
+        self.requests: list[tuple[str, dict]] = []
+
+    def _request(self, method, params):
+        self.requests.append((method, params))
+        return {"ok": True, "result": True}
 
 
 class TelegramAPITests(unittest.TestCase):
@@ -73,6 +83,33 @@ class TelegramAPITests(unittest.TestCase):
         chunks = split_telegram_text(text, limit=120)
         self.assertGreater(len(chunks), 1)
         self.assertEqual("".join(chunks), text)
+
+    def test_set_bot_commands_uses_short_menu(self):
+        telegram = RecordingTelegramAPI()
+
+        telegram.set_bot_commands(
+            [
+                ("/reset", "Reset"),
+                ("/models", "Models"),
+                ("/workspace", "Workspace"),
+            ]
+        )
+
+        self.assertEqual(
+            telegram.requests,
+            [
+                (
+                    "setMyCommands",
+                    {
+                        "commands": [
+                            {"command": "reset", "description": "Reset"},
+                            {"command": "models", "description": "Models"},
+                            {"command": "workspace", "description": "Workspace"},
+                        ]
+                    },
+                )
+            ],
+        )
 
 
 if __name__ == "__main__":

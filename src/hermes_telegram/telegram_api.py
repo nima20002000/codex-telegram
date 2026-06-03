@@ -151,6 +151,17 @@ class TelegramAPI:
         result = payload.get("result", [])
         return result if isinstance(result, list) else []
 
+    def set_bot_commands(self, commands: list[tuple[str, str]]) -> None:
+        self._request(
+            "setMyCommands",
+            {
+                "commands": [
+                    {"command": command.removeprefix("/"), "description": description}
+                    for command, description in commands
+                ],
+            },
+        )
+
     def send_message(
         self,
         chat_id: str,

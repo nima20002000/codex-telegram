@@ -58,12 +58,16 @@ the process exits.
 
 ## Commands
 
-- `/start` or `/help`: show help
-- `/status`: show the configured Codex workspace and allowlist counts
-- `/models`: choose a Codex model, then choose the thinking amount for this chat
-- `/reset`: clear this Telegram chat's local bridge history
+- `/reset`
+- `/models`
+- `/workspace`
 
 Any other text message is sent to `codex exec`.
+
+`/workspace` opens an inline folder browser rooted at `CODEX_WORKDIR`. Use folder
+buttons to move into child directories, then press `Start session` to make later
+messages run in that directory with the default model. The selected workspace is
+stored per Telegram chat.
 
 Model choices come from the local `codex debug models` catalog when available.
 The selected model and thinking amount are stored per Telegram chat under the

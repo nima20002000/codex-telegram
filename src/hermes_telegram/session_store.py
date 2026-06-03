@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -33,6 +34,8 @@ class SessionStore:
         self._sessions_dir.mkdir(parents=True, exist_ok=True)
         self._processed_path = state_dir / "processed_messages.json"
         self._preferences_path = state_dir / "model_preferences.json"
+        self._workspaces_path = state_dir / "workspaces.json"
+        self._workspace_tokens_path = state_dir / "workspace_tokens.json"
 
     def _path(self, chat_id: str) -> Path:
         return self._sessions_dir / f"{_safe_chat_key(chat_id)}.json"
@@ -151,3 +154,42 @@ class SessionStore:
             return
         del preferences[chat_id]
         self._save_preferences(preferences)
+
+    def _load_string_map(self, path: Path) -> dict[str, str]:
+        if not path.exists():
+            return {}
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+        return {str(key): value for key, value in raw.items() if isinstance(value, str)}
+
+    def _save_string_map(self, path: Path, values: dict[str, str]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(values, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def load_active_workspace(self, chat_id: str) -> str:
+        return self._load_string_map(self._workspaces_path).get(chat_id, "")
+
+    def save_active_workspace(self, chat_id: str, relative_path: str) -> None:
+        workspaces = self._load_string_map(self._workspaces_path)
+        workspaces[chat_id] = relative_path
+        self._save_string_map(self._workspaces_path, workspaces)
+
+    def clear_active_workspace(self, chat_id: str) -> None:
+        workspaces = self._load_string_map(self._workspaces_path)
+        if chat_id not in workspaces:
+            return
+        del workspaces[chat_id]
+        self._save_string_map(self._workspaces_path, workspaces)
+
+    def remember_workspace_token(self, relative_path: str) -> str:
+        token = hashlib.sha256(relative_path.encode("utf-8")).hexdigest()[:16]
+        tokens = self._load_string_map(self._workspace_tokens_path)
+        tokens[token] = relative_path
+        self._save_string_map(self._workspace_tokens_path, tokens)
+        return token
+
+    def resolve_workspace_token(self, token: str) -> str | None:
+        return self._load_string_map(self._workspace_tokens_path).get(token)

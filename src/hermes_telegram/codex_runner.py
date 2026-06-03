@@ -25,12 +25,14 @@ class CodexRunner:
         *,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        workdir: Path | None = None,
     ) -> list[str]:
+        selected_workdir = workdir or self._settings.codex_workdir
         args = [
             self._settings.codex_command,
             "exec",
             "-C",
-            str(self._settings.codex_workdir),
+            str(selected_workdir),
             "--sandbox",
             self._settings.codex_sandbox,
             "--output-last-message",
@@ -48,10 +50,23 @@ class CodexRunner:
             args[2:2] = list(self._settings.codex_extra_args)
         return args
 
-    def run(self, prompt: str, *, model: str | None = None, reasoning_effort: str | None = None) -> CodexResult:
+    def run(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        workdir: Path | None = None,
+    ) -> CodexResult:
+        selected_workdir = workdir or self._settings.codex_workdir
         with tempfile.TemporaryDirectory(prefix="hermes-telegram-codex-") as tmpdir:
             output_path = Path(tmpdir) / "last-message.txt"
-            command = self._build_command(output_path, model=model, reasoning_effort=reasoning_effort)
+            command = self._build_command(
+                output_path,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                workdir=selected_workdir,
+            )
             try:
                 completed = subprocess.run(
                     command,
@@ -59,7 +74,7 @@ class CodexRunner:
                     text=True,
                     capture_output=True,
                     timeout=self._settings.codex_timeout_seconds,
-                    cwd=str(self._settings.codex_workdir),
+                    cwd=str(selected_workdir),
                     check=False,
                 )
             except subprocess.TimeoutExpired as exc:

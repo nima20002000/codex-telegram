@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from .codex_runner import CodexRunner
 from .config import Settings
@@ -46,6 +47,67 @@ class HermesTelegramGateway:
         self._sessions = sessions
         self._offset: int | None = None
 
+    def _workspace_path(self, relative_path: str) -> Path | None:
+        root = self._settings.codex_workdir.resolve()
+        candidate = root if relative_path in {"", "."} else (root / relative_path).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            return None
+        if not candidate.is_dir():
+            return None
+        return candidate
+
+    def _workspace_relative_path(self, path: Path) -> str:
+        rel = path.resolve().relative_to(self._settings.codex_workdir.resolve())
+        return "" if rel == Path(".") else rel.as_posix()
+
+    def _active_workdir(self, chat_id: str | None) -> Path:
+        if chat_id is None:
+            return self._settings.codex_workdir
+        relative_path = self._sessions.load_active_workspace(chat_id)
+        path = self._workspace_path(relative_path)
+        if path is None:
+            self._sessions.clear_active_workspace(chat_id)
+            return self._settings.codex_workdir
+        return path
+
+    def _child_workspaces(self, path: Path) -> list[Path]:
+        root = self._settings.codex_workdir.resolve()
+        state_dir = self._settings.state_dir.resolve()
+        children: list[Path] = []
+        try:
+            candidates = path.iterdir()
+        except OSError:
+            return []
+        for child in candidates:
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            try:
+                resolved = child.resolve()
+                resolved.relative_to(root)
+            except (OSError, ValueError):
+                continue
+            if resolved == state_dir:
+                continue
+            children.append(child)
+        return sorted(children, key=lambda child: child.name.lower())
+
+    def _workspace_keyboard(self, path: Path) -> dict[str, list[list[dict[str, str]]]]:
+        current_relative = self._workspace_relative_path(path)
+        current_token = self._sessions.remember_workspace_token(current_relative)
+        rows = [[self._button("Start session", f"ws:s:{current_token}")]]
+        for child in self._child_workspaces(path):
+            child_token = self._sessions.remember_workspace_token(self._workspace_relative_path(child))
+            rows.append([self._button(child.name, f"ws:o:{child_token}")])
+        if current_relative:
+            parent_token = self._sessions.remember_workspace_token(self._workspace_relative_path(path.parent))
+            rows.append([self._button("Back", f"ws:o:{parent_token}")])
+        return {"inline_keyboard": rows}
+
+    def _workspace_text(self, path: Path) -> str:
+        return f"Workspace:\n{path}"
+
     def _active_model_preference(self, chat_id: str | None) -> ChatModelPreference | None:
         if chat_id is None:
             return None
@@ -75,7 +137,7 @@ class HermesTelegramGateway:
     def status(self, chat_id: str | None = None) -> GatewayStatus:
         preference = self._active_model_preference(chat_id)
         return GatewayStatus(
-            workdir=str(self._settings.codex_workdir),
+            workdir=str(self._active_workdir(chat_id)),
             allowed_users=len(self._settings.allowed_users),
             allowed_chats=len(self._settings.allowed_chats),
             model=(preference.model if preference else self._settings.codex_model or "default"),
@@ -98,7 +160,8 @@ class HermesTelegramGateway:
         history = self._sessions.render_recent(message.chat_id)
         identity = (
             f"Telegram user_id={message.user_id or 'unknown'} "
-            f"username={message.username or 'unknown'} chat_id={message.chat_id}"
+            f"username={message.username or 'unknown'} chat_id={message.chat_id} "
+            f"workspace={self._active_workdir(message.chat_id)}"
         )
         parts = [SYSTEM_PROMPT.strip(), identity]
         if history:
@@ -109,13 +172,7 @@ class HermesTelegramGateway:
     def _command_response(self, message: IncomingMessage) -> str | None:
         command = message.text.split(maxsplit=1)[0].split("@", 1)[0].lower()
         if command in {"/start", "/help"}:
-            return (
-                "Hermes Telegram bridge is online.\n\n"
-                "Send a normal message to run Codex in the configured workspace.\n"
-                "/status shows the current workspace.\n"
-                "/models selects the Codex model and thinking amount.\n"
-                "/reset clears this chat's local bridge history."
-            )
+            return "/reset\n/models\n/workspace"
         if command == "/status":
             status = self.status(message.chat_id)
             return (
@@ -156,6 +213,15 @@ class HermesTelegramGateway:
             reply_markup=self._model_keyboard(),
         )
 
+    def _send_workspace_browser(self, message: IncomingMessage) -> None:
+        path = self._settings.codex_workdir.resolve()
+        self._telegram.send_message(
+            message.chat_id,
+            self._workspace_text(path),
+            reply_to_message_id=message.message_id,
+            reply_markup=self._workspace_keyboard(path),
+        )
+
     def handle_message(self, message: IncomingMessage) -> None:
         if not self._is_authorized(message):
             logger.warning("Unauthorized Telegram message from user=%s chat=%s", message.user_id, message.chat_id)
@@ -164,6 +230,9 @@ class HermesTelegramGateway:
         command = message.text.split(maxsplit=1)[0].split("@", 1)[0].lower()
         if command == "/models":
             self._send_model_picker(message)
+            return
+        if command == "/workspace":
+            self._send_workspace_browser(message)
             return
 
         command_response = self._command_response(message)
@@ -186,6 +255,7 @@ class HermesTelegramGateway:
             prompt,
             model=preference.model if preference else None,
             reasoning_effort=preference.reasoning_effort if preference else None,
+            workdir=self._active_workdir(message.chat_id),
         )
         response = result.text.strip()
         if len(response) > self._settings.max_telegram_response_chars:
@@ -234,6 +304,36 @@ class HermesTelegramGateway:
                 f"Choose thinking amount for {model.display_name}:",
                 reply_markup=self._effort_keyboard(model),
             )
+            return
+
+        if callback.data.startswith("ws:"):
+            parts = callback.data.split(":", 2)
+            if len(parts) != 3:
+                self._telegram.answer_callback_query(callback.callback_query_id, text="Unknown action.")
+                return
+            _, action, token = parts
+            relative_path = self._sessions.resolve_workspace_token(token)
+            path = self._workspace_path(relative_path or "") if relative_path is not None else None
+            if path is None:
+                self._telegram.answer_callback_query(callback.callback_query_id, text="Workspace is not available.")
+                self._reply_to_callback(callback, "Workspace is not available. Send /workspace again.")
+                return
+            if action == "o":
+                self._telegram.answer_callback_query(callback.callback_query_id)
+                self._reply_to_callback(
+                    callback,
+                    self._workspace_text(path),
+                    reply_markup=self._workspace_keyboard(path),
+                )
+                return
+            if action == "s":
+                self._sessions.save_active_workspace(callback.chat_id, self._workspace_relative_path(path))
+                self._sessions.reset(callback.chat_id)
+                self._sessions.clear_model_preference(callback.chat_id)
+                self._telegram.answer_callback_query(callback.callback_query_id, text="Session started.")
+                self._reply_to_callback(callback, f"Session workspace:\n{path}\n\nModel: default")
+                return
+            self._telegram.answer_callback_query(callback.callback_query_id, text="Unknown action.")
             return
 
         if callback.data.startswith("effort:"):

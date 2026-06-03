@@ -46,12 +46,12 @@ class FakeTelegram:
 class FakeCodex:
     def __init__(self, response="done"):
         self.prompts: list[str] = []
-        self.runs: list[tuple[str | None, str | None]] = []
+        self.runs: list[tuple[str | None, str | None, Path | None]] = []
         self.response = response
 
-    def run(self, prompt, *, model=None, reasoning_effort=None):
+    def run(self, prompt, *, model=None, reasoning_effort=None, workdir=None):
         self.prompts.append(prompt)
-        self.runs.append((model, reasoning_effort))
+        self.runs.append((model, reasoning_effort, workdir))
         return CodexResult(text=self.response, returncode=0, stderr="")
 
 
@@ -138,8 +138,163 @@ class GatewayTests(unittest.TestCase):
             gateway.handle_message(self._message("/help"))
 
             self.assertEqual(len(codex.prompts), 0)
-            self.assertIn("online", telegram.messages[0][1])
-            self.assertIn("/models", telegram.messages[0][1])
+            self.assertEqual(telegram.messages[0][1], "/reset\n/models\n/workspace")
+
+    def test_status_command_shows_status(self):
+        with TemporaryDirectory() as tmp:
+            telegram = FakeTelegram()
+            codex = FakeCodex()
+            gateway = HermesTelegramGateway(
+                settings=self._settings(Path(tmp)),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(Path(tmp) / "state"),
+            )
+
+            gateway.handle_message(self._message("/status"))
+
+            self.assertEqual(len(codex.prompts), 0)
+            self.assertIn(f"Workspace: {Path(tmp).resolve()}", telegram.messages[0][1])
+            self.assertIn("Model: default", telegram.messages[0][1])
+
+    def test_workspace_command_shows_folder_buttons(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "avatar").mkdir()
+            (root / "beta").mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex()
+            gateway = HermesTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(self._message("/workspace"))
+
+            self.assertEqual(len(codex.prompts), 0)
+            self.assertEqual(telegram.messages[0][1], f"Workspace:\n{root.resolve()}")
+            keyboard = telegram.reply_markups[0]["inline_keyboard"]
+            self.assertEqual(keyboard[0][0]["text"], "Start session")
+            self.assertEqual([row[0]["text"] for row in keyboard[1:]], ["avatar", "beta"])
+
+    def test_workspace_command_starts_from_root_even_after_selection(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "avatar").mkdir()
+            store = SessionStore(root / ".state")
+            store.save_active_workspace("100", "avatar")
+            telegram = FakeTelegram()
+            gateway = HermesTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("/workspace"))
+
+            self.assertEqual(telegram.messages[0][1], f"Workspace:\n{root.resolve()}")
+
+    def test_workspace_command_skips_external_symlinked_directories(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "desktop"
+            root.mkdir()
+            (root / "avatar").mkdir()
+            external = base / "external"
+            external.mkdir()
+            (root / "outside").symlink_to(external, target_is_directory=True)
+            telegram = FakeTelegram()
+            gateway = HermesTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(self._message("/workspace"))
+
+            keyboard = telegram.reply_markups[0]["inline_keyboard"]
+            self.assertEqual([row[0]["text"] for row in keyboard[1:]], ["avatar"])
+
+    def test_workspace_folder_button_navigates_deeper(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            avatar = root / "avatar"
+            avatar.mkdir()
+            (avatar / "child").mkdir()
+            telegram = FakeTelegram()
+            gateway = HermesTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(self._message("/workspace"))
+            avatar_button = telegram.reply_markups[0]["inline_keyboard"][1][0]
+            gateway.handle_callback(self._callback(avatar_button["callback_data"]))
+
+            self.assertEqual(telegram.edits[0][2], f"Workspace:\n{avatar.resolve()}")
+            keyboard = telegram.edits[0][3]["inline_keyboard"]
+            self.assertEqual([row[0]["text"] for row in keyboard], ["Start session", "child", "Back"])
+
+    def test_start_workspace_session_sets_workdir_and_default_model(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            avatar = root / "avatar"
+            avatar.mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex("finished")
+            store = SessionStore(root / ".state")
+            store.save_model_preference("100", model="gpt-5.5", reasoning_effort="xhigh")
+            store.append("100", "user", "old context")
+            gateway = HermesTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("/workspace"))
+            avatar_button = telegram.reply_markups[0]["inline_keyboard"][1][0]
+            gateway.handle_callback(self._callback(avatar_button["callback_data"]))
+            start_button = telegram.edits[0][3]["inline_keyboard"][0][0]
+            gateway.handle_callback(self._callback(start_button["callback_data"]))
+            gateway.handle_message(self._message("do the task"))
+
+            self.assertEqual(store.load_active_workspace("100"), "avatar")
+            self.assertIsNone(store.load_model_preference("100"))
+            self.assertIn(f"Session workspace:\n{avatar.resolve()}", telegram.edits[1][2])
+            self.assertEqual(codex.runs[-1], (None, None, avatar.resolve()))
+            self.assertNotIn("old context", codex.prompts[-1])
+
+    def test_workspace_callback_rejects_path_escape(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            token = store.remember_workspace_token("..")
+            gateway = HermesTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_callback(self._callback(f"ws:o:{token}"))
+
+            self.assertEqual(telegram.callback_answers, [("cb1", "Workspace is not available.")])
+            self.assertIn("Workspace is not available", telegram.edits[0][2])
 
     def test_authorized_message_runs_codex_and_stores_history(self):
         with TemporaryDirectory() as tmp:
@@ -158,7 +313,7 @@ class GatewayTests(unittest.TestCase):
 
             self.assertEqual(telegram.actions, ["100:typing"])
             self.assertEqual(telegram.messages[-1][1], "finished")
-            self.assertEqual(codex.runs[-1], (None, None))
+            self.assertEqual(codex.runs[-1], (None, None, Path(tmp).resolve()))
             self.assertIn("Current Telegram message", codex.prompts[0])
             self.assertNotIn("User: change the repo", codex.prompts[0])
             self.assertEqual([turn.role for turn in store.load("100")], ["user", "assistant"])
@@ -298,7 +453,7 @@ class GatewayTests(unittest.TestCase):
             self.assertIsNotNone(preference)
             self.assertEqual(preference.model, "gpt-5.5")
             self.assertEqual(preference.reasoning_effort, "xhigh")
-            self.assertEqual(codex.runs[-1], ("gpt-5.5", "xhigh"))
+            self.assertEqual(codex.runs[-1], ("gpt-5.5", "xhigh", Path(tmp).resolve()))
             self.assertIn("Selected GPT-5.5", telegram.edits[0][2])
 
     def test_unavailable_saved_model_is_ignored_and_cleared(self):
@@ -317,7 +472,7 @@ class GatewayTests(unittest.TestCase):
 
             gateway.handle_message(self._message("do the task"))
 
-            self.assertEqual(codex.runs[-1], (None, None))
+            self.assertEqual(codex.runs[-1], (None, None, Path(tmp).resolve()))
             self.assertIsNone(store.load_model_preference("100"))
 
     def test_saved_model_is_kept_when_catalog_is_not_authoritative(self):
@@ -336,7 +491,7 @@ class GatewayTests(unittest.TestCase):
 
             gateway.handle_message(self._message("do the task"))
 
-            self.assertEqual(codex.runs[-1], ("gpt-5.2", "medium"))
+            self.assertEqual(codex.runs[-1], ("gpt-5.2", "medium", Path(tmp).resolve()))
             self.assertIsNotNone(store.load_model_preference("100"))
 
     def test_poll_once_advances_offset_when_handler_raises(self):

@@ -46,6 +46,26 @@ class SessionStoreTests(unittest.TestCase):
             store.clear_model_preference("chat")
             self.assertIsNone(store.load_model_preference("chat"))
 
+    def test_active_workspace_round_trip(self):
+        with TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+
+            self.assertEqual(store.load_active_workspace("chat"), "")
+            store.save_active_workspace("chat", "avatar/project")
+            self.assertEqual(store.load_active_workspace("chat"), "avatar/project")
+
+            store.clear_active_workspace("chat")
+            self.assertEqual(store.load_active_workspace("chat"), "")
+
+    def test_workspace_token_round_trip(self):
+        with TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+
+            token = store.remember_workspace_token("avatar/project")
+
+            self.assertEqual(store.resolve_workspace_token(token), "avatar/project")
+            self.assertLessEqual(len(token), 16)
+
 
 if __name__ == "__main__":
     unittest.main()

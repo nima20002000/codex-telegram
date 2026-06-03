@@ -97,6 +97,29 @@ class CodexRunnerTests(unittest.TestCase):
             self.assertIn("-c", command)
             self.assertIn('model_reasoning_effort="xhigh"', command)
 
+    def test_runner_uses_per_chat_workdir_override(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            selected = root / "avatar"
+            selected.mkdir()
+            seen: dict[str, object] = {}
+
+            def fake_run(command, **kwargs):
+                seen["command"] = command
+                seen["kwargs"] = kwargs
+                output_path = Path(command[command.index("--output-last-message") + 1])
+                output_path.write_text("final answer", encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with patch("subprocess.run", side_effect=fake_run):
+                CodexRunner(self._settings(root)).run("do work", workdir=selected)
+
+            command = seen["command"]
+            self.assertIsInstance(command, list)
+            assert isinstance(command, list)
+            self.assertEqual(command[command.index("-C") + 1], str(selected))
+            self.assertEqual(seen["kwargs"]["cwd"], str(selected))
+
 
 if __name__ == "__main__":
     unittest.main()
