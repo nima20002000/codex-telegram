@@ -1,6 +1,8 @@
 # Hermes Telegram
 
-Standalone Telegram bridge for running Codex from a Telegram bot chat.
+MIT-licensed local Telegram bridge for running Codex from a bot chat.
+
+This tool has only been tested on Ubuntu with the Codex CLI.
 
 This repo extracts the useful Telegram gateway shape from Hermes into a small local service:
 
@@ -11,50 +13,56 @@ This repo extracts the useful Telegram gateway shape from Hermes into a small lo
 - runs `codex exec` in the configured local workspace
 - replies to Telegram with the final Codex response
 
-## Setup
+## Requirements
+
+- Ubuntu with systemd user services
+- Python 3.10+
+- Codex CLI available to the service through `CODEX_COMMAND`
+- Telegram bot token from BotFather
+- Numeric Telegram user ID for the allowed user list
+
+## Install
 
 ```bash
 cd $HOME/Desktop/hermes-telegram
-cp .env.example .env
+bash scripts/install.sh
 ```
 
-Edit `.env`:
+The installer:
 
-```bash
-TELEGRAM_BOT_TOKEN=123456:from-botfather
-TELEGRAM_ALLOWED_USERS=123456789
-CODEX_WORKDIR=$HOME/Desktop
-HERMES_TELEGRAM_STATE_DIR=$HOME/Desktop/hermes-telegram/.hermes-telegram
-```
+- installs the package with `python3 -m pip install -e .`
+- falls back to an ignored repo-local `.venv` if system `pip` is unavailable or refuses the editable install
+- creates `.env` from `.env.example` only when `.env` is missing
+- preserves existing `.env` values, including bot token, allowed users, Codex command, sandbox, and workdir
+- resolves `codex` to an absolute `CODEX_COMMAND` path for newly created env files
+- prompts only for missing `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USERS`
+- installs and restarts the user service at `~/.config/systemd/user/hermes-telegram.service`
+- enables linger so the user service can run after reboot without an interactive login
 
-Then run:
+For a one-off foreground run without systemd:
 
 ```bash
 PYTHONPATH=src python3 -m hermes_telegram.cli --env-file .env
 ```
 
-Or install the package in editable mode and use the console script:
+Or after installation:
 
 ```bash
-python3 -m pip install -e .
 hermes-telegram --env-file .env
 ```
 
-## Run On Startup
+## Verify
 
-Install the user service:
+Check service state and recent logs:
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp deploy/systemd/hermes-telegram.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now hermes-telegram.service
-loginctl enable-linger "$USER"
+systemctl --user status hermes-telegram.service --no-pager
+journalctl --user -u hermes-telegram.service --since '2 minutes ago' --no-pager
 ```
 
-The committed unit assumes the checkout stays at `$HOME/Desktop/hermes-telegram`.
-It reads the ignored `.env`, runs Codex in `CODEX_WORKDIR`, and restarts the bridge if
-the process exits.
+From the allowed Telegram user, send `/status`, `/models`, `/workspace`, and
+`/sandbox`. Replies should arrive and logs should not show authorization or
+runtime errors.
 
 ## Commands
 
@@ -80,6 +88,23 @@ Codex with `--sandbox workspace-write`. YOLO runs Codex with
 `--dangerously-bypass-approvals-and-sandbox`, which disables approval prompts and
 sandboxing. The selected sandbox mode is stored per Telegram chat and stays in
 effect for later messages and sessions.
+
+## Disable Or Uninstall
+
+Disable the service:
+
+```bash
+systemctl --user disable --now hermes-telegram.service
+```
+
+Remove the package installation from the active Python environment:
+
+```bash
+python3 -m pip uninstall hermes-telegram
+```
+
+Local runtime state remains in `.env` and `.hermes-telegram/` unless you remove
+those files yourself.
 
 ## Environment
 
@@ -112,6 +137,17 @@ Bridge options:
 
 - `SESSION_HISTORY_TURNS`: defaults to `8`
 - `HERMES_TELEGRAM_STATE_DIR`: defaults to `$CODEX_WORKDIR/.hermes-telegram`
+
+## Security
+
+`.env` is local secret state and must not be committed. It contains the Telegram
+bot token and allowed user IDs. The repository ignores `.env`, `.hermes-telegram/`,
+Python caches, build output, and local backup files. Do not paste bot tokens or
+Telegram user IDs into issues, logs, commits, or documentation.
+
+YOLO mode is intentionally dangerous. It maps to Codex
+`--dangerously-bypass-approvals-and-sandbox`, skipping approval prompts and
+running without sandboxing. Use it only for chats and workspaces you trust.
 
 ## Tests
 
