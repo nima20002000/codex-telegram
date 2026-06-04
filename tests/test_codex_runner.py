@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import subprocess
 import unittest
 from pathlib import Path
@@ -8,6 +9,33 @@ from unittest.mock import patch
 
 from codex_telegram.codex_runner import CodexRunner
 from codex_telegram.config import Settings
+
+
+class FakePopen:
+    def __init__(self, command, *, stdin, stdout, stderr, text, cwd):
+        self.command = command
+        self.stdin = io.StringIO()
+        self.stdout = iter(
+            [
+                '{"type":"item.started","item":{"type":"command_execution"}}\n',
+                '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}\n',
+            ]
+        )
+        self.stderr = stderr
+        self.returncode = 0
+        self._polled = False
+
+    def poll(self):
+        if not self._polled:
+            self._polled = True
+            return None
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        self.returncode = 124
 
 
 class CodexRunnerTests(unittest.TestCase):
@@ -181,6 +209,33 @@ class CodexRunnerTests(unittest.TestCase):
             assert isinstance(command, list)
             self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
             self.assertNotIn("--sandbox", command)
+
+    def test_runner_streams_json_events_and_reads_last_message(self):
+        with TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            events: list[dict[str, object]] = []
+            seen: dict[str, object] = {}
+
+            def fake_popen(command, **kwargs):
+                seen["command"] = command
+                output_path = Path(command[command.index("--output-last-message") + 1])
+                output_path.write_text("streamed final answer", encoding="utf-8")
+                return FakePopen(command, **kwargs)
+
+            with patch("subprocess.Popen", side_effect=fake_popen):
+                result = CodexRunner(self._settings(workdir)).run(
+                    "do work",
+                    progress_callback=events.append,
+                )
+
+            command = seen["command"]
+            self.assertIsInstance(command, list)
+            assert isinstance(command, list)
+            self.assertIn("--json", command)
+            self.assertEqual(result.text, "streamed final answer")
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(len(events), 2)
+            self.assertEqual(events[0]["type"], "item.started")
 
     def test_compact_uses_safe_summary_prompt_and_runtime_overrides(self):
         with TemporaryDirectory() as tmp:

@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 
 from codex_telegram.codex_runner import EMPTY_CODEX_RESPONSE, CodexResult
 from codex_telegram.config import Settings
-from codex_telegram.gateway import CodexTelegramGateway
+from codex_telegram.gateway import CodexTelegramGateway, sanitize_progress_text
 from codex_telegram.model_catalog import ModelChoice
 from codex_telegram.session_store import SessionStore
 from codex_telegram.telegram_api import ChatInfo, ForumTopic, IncomingCallback, IncomingMessage, TelegramAPIError
@@ -104,10 +104,31 @@ class FakeCodex:
         self.compact_response = "compacted summary"
         self.compact_returncode = 0
         self.response = response
+        self.emit_progress = False
 
-    def run(self, prompt, *, model=None, reasoning_effort=None, workdir=None, sandbox_mode=None):
+    def run(
+        self,
+        prompt,
+        *,
+        model=None,
+        reasoning_effort=None,
+        workdir=None,
+        sandbox_mode=None,
+        progress_callback=None,
+    ):
         self.prompts.append(prompt)
         self.runs.append((model, reasoning_effort, workdir, sandbox_mode))
+        if self.emit_progress and progress_callback is not None:
+            progress_callback(
+                {
+                    "type": "item.started",
+                    "item": {
+                        "type": "command_execution",
+                        "command": "/bin/bash -lc pwd",
+                        "status": "in_progress",
+                    },
+                }
+            )
         return CodexResult(text=self.response, returncode=0, stderr="")
 
     def compact(
@@ -261,6 +282,24 @@ class GatewayTests(unittest.TestCase):
             self.assertIn("Sandbox: configured (workspace-write)", telegram.messages[0][1])
             self.assertIn("Fast mode: off", telegram.messages[0][1])
             self.assertIn("Goal: none", telegram.messages[0][1])
+
+    def test_progress_text_suppresses_code_diffs_and_redacts_secrets(self):
+        self.assertIsNone(sanitize_progress_text("```python\nprint('secret')\n```"))
+        self.assertIsNone(sanitize_progress_text("diff --git a/app.py b/app.py"))
+        self.assertIsNone(sanitize_progress_text("+ token = 'abc'"))
+        text = sanitize_progress_text(
+            "Using TELEGRAM_BOT_TOKEN=123456:abcdefghijklmnopqrstuvwxyz "
+            "from /tmp/.env and .codex-telegram/e2e/admin-account.session in chat -1001234567890"
+        )
+
+        self.assertIsNotNone(text)
+        assert text is not None
+        self.assertIn("TELEGRAM_BOT_TOKEN=<redacted>", text)
+        self.assertIn("<env-file>", text)
+        self.assertIn("<session-file>", text)
+        self.assertIn("<chat>", text)
+        self.assertNotIn("abcdefghijklmnopqrstuvwxyz", text)
+        self.assertNotIn("-1001234567890", text)
 
     def test_workspace_command_shows_folder_buttons(self):
         with TemporaryDirectory() as tmp:
@@ -924,6 +963,42 @@ class GatewayTests(unittest.TestCase):
             self.assertIn("Objective: ship the topic feature", telegram.messages[-2][1])
             self.assertIn("Active Telegram goal", codex.prompts[-1])
             self.assertIn("ship the topic feature", codex.prompts[-1])
+
+    def test_progress_messages_route_only_to_active_topic(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            topic_key = "-1001:thread:7"
+            telegram = FakeTelegram()
+            codex = FakeCodex("final response")
+            codex.emit_progress = True
+            store = SessionStore(root / ".state")
+            for thread_id in (7, 8):
+                store.save_topic_session(
+                    chat_id="-1001",
+                    message_thread_id=thread_id,
+                    session_key=f"-1001:thread:{thread_id}",
+                    topic_name=f"topic {thread_id}",
+                    workspace="",
+                    model="gpt-5.5",
+                    reasoning_effort="high",
+                    sandbox_mode="constrained",
+                )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("do work", chat_id="-1001", message_thread_id=7))
+
+            self.assertEqual(codex.runs[-1], (None, None, root.resolve(), None))
+            self.assertIn("Working: running a local command", telegram.messages[-2][1])
+            self.assertEqual(telegram.message_threads[-2], 7)
+            self.assertEqual(telegram.messages[-1][1], "final response")
+            self.assertEqual(telegram.message_threads[-1], 7)
+            self.assertEqual(store.load("-1001:thread:8"), [])
 
     def test_goal_command_is_topic_scoped_and_general_chat_does_not_mutate_topics(self):
         with TemporaryDirectory() as tmp:

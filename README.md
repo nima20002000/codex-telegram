@@ -122,6 +122,12 @@ deployment check must prove the service is running a specific commit.
 
 Any other text message is sent to `codex exec`.
 
+While Codex is working, the bridge may post short progress messages in the same
+topic, such as local command start/finish notices. Progress messages are
+rate-limited and sanitized: code blocks, raw diffs, bot tokens, `.env` paths,
+Telegram session files, and private chat IDs are suppressed or redacted before
+Telegram sees them. The final Codex answer is still sent after the run finishes.
+
 `/compact` is for topic-backed Codex sessions. It summarizes that topic's saved
 Telegram conversation context, stores the compact summary locally, clears the
 raw recent history for that topic, and keeps later messages in that topic using

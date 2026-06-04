@@ -22,6 +22,7 @@ from .telegram_api import (
 logger = logging.getLogger(__name__)
 
 AUTO_COMPACT_HISTORY_CHARS = 24000
+PROGRESS_MIN_INTERVAL_SECONDS = 5.0
 REASONING_EFFORT_RANK = {
     "minimal": 0,
     "none": 0,
@@ -36,7 +37,18 @@ SYSTEM_PROMPT = """You are Codex, reached through a Telegram bot bridge.
 Work in the configured repository and answer concisely for a chat interface.
 When changing files, make the real change in the local workspace and verify it.
 Do not ask the Telegram user to copy files that already exist on this machine.
+For Telegram replies, summarize code changes instead of pasting code blocks or raw diffs unless explicitly requested and safe.
+Never include secrets, tokens, .env values, Telegram session data, or private chat IDs.
 """
+
+
+SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b([A-Za-z0-9_-]*(?:token|api[_-]?key|api[_-]?hash|password|secret)[A-Za-z0-9_-]*)\s*[:=]\s*[^,\s]+"
+)
+BOT_TOKEN_RE = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b")
+PRIVATE_CHAT_ID_RE = re.compile(r"-100\d{6,}")
+ENV_PATH_RE = re.compile(r"\S*\.env(?:\.\S+)?")
+SESSION_PATH_RE = re.compile(r"\S+\.session\b")
 
 
 @dataclass(frozen=True)
@@ -66,6 +78,33 @@ class TopicLifecycleRequest:
     action: str
     target: str
     new_name: str | None = None
+
+
+def sanitize_progress_text(text: str) -> str | None:
+    if "```" in text:
+        return None
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(("diff --git", "@@", "+++", "---")):
+            return None
+        if stripped.startswith(("+", "-")) and len(stripped) > 1:
+            return None
+        lines.append(stripped)
+    sanitized = " ".join(lines)
+    sanitized = BOT_TOKEN_RE.sub("<redacted-token>", sanitized)
+    sanitized = SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}=<redacted>", sanitized)
+    sanitized = PRIVATE_CHAT_ID_RE.sub("<chat>", sanitized)
+    sanitized = ENV_PATH_RE.sub("<env-file>", sanitized)
+    sanitized = SESSION_PATH_RE.sub("<session-file>", sanitized)
+    sanitized = re.sub(r"\s+", " ", sanitized).strip()
+    if not sanitized:
+        return None
+    if len(sanitized) > 240:
+        sanitized = sanitized[:237].rstrip() + "..."
+    return sanitized
 
 
 class CodexTelegramGateway:
@@ -1047,6 +1086,50 @@ class CodexTelegramGateway:
             return
         self._compact_session(message, auto=True, reply_to_message_id=message.message_id)
 
+    def _progress_text_from_codex_event(self, event: dict[str, object]) -> str | None:
+        item = event.get("item")
+        if not isinstance(item, dict):
+            return None
+        item_type = item.get("type")
+        event_type = event.get("type")
+        if item_type != "command_execution":
+            return None
+        if event_type == "item.started":
+            return sanitize_progress_text("Working: running a local command for this topic.")
+        if event_type == "item.completed":
+            exit_code = item.get("exit_code")
+            if exit_code == 0:
+                return sanitize_progress_text("Working: local command finished.")
+            return sanitize_progress_text("Working: local command failed; the final answer will summarize it.")
+        return None
+
+    def _progress_callback_for_message(self, message: IncomingMessage):
+        last_sent_at = 0.0
+        last_text = ""
+
+        def callback(event: dict[str, object]) -> None:
+            nonlocal last_sent_at, last_text
+            text = self._progress_text_from_codex_event(event)
+            if text is None or text == last_text:
+                return
+            now = time.monotonic()
+            if last_sent_at and now - last_sent_at < PROGRESS_MIN_INTERVAL_SECONDS:
+                return
+            try:
+                self._telegram.send_message(
+                    message.chat_id,
+                    text,
+                    reply_to_message_id=message.message_id,
+                    message_thread_id=message.message_thread_id,
+                )
+            except Exception:
+                logger.warning("Failed to send Telegram progress message", exc_info=True)
+                return
+            last_sent_at = now
+            last_text = text
+
+        return callback
+
     @staticmethod
     def _button(text: str, callback_data: str) -> dict[str, str]:
         return {"text": text, "callback_data": callback_data}
@@ -1165,6 +1248,7 @@ class CodexTelegramGateway:
                 reasoning_effort=preference.reasoning_effort if preference else None,
                 workdir=self._active_workdir(session_key),
                 sandbox_mode=self._active_sandbox_mode(session_key),
+                progress_callback=self._progress_callback_for_message(message),
             )
         finally:
             self._active_session_keys.discard(session_key)

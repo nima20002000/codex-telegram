@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import json
+import queue
 import subprocess
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from .config import Settings
 
@@ -29,6 +34,7 @@ class CodexRunner:
         reasoning_effort: str | None = None,
         workdir: Path | None = None,
         sandbox_mode: str | None = None,
+        json_output: bool = False,
     ) -> list[str]:
         selected_workdir = workdir or self._settings.codex_workdir
         args = [
@@ -40,6 +46,8 @@ class CodexRunner:
             str(output_path),
             "-",
         ]
+        if json_output:
+            args.insert(2, "--json")
         if sandbox_mode == "yolo":
             args[2:2] = ["--dangerously-bypass-approvals-and-sandbox"]
         else:
@@ -69,6 +77,7 @@ class CodexRunner:
         reasoning_effort: str | None = None,
         workdir: Path | None = None,
         sandbox_mode: str | None = None,
+        progress_callback: Callable[[dict[str, object]], None] | None = None,
     ) -> CodexResult:
         selected_workdir = workdir or self._settings.codex_workdir
         with tempfile.TemporaryDirectory(prefix="codex-telegram-codex-") as tmpdir:
@@ -79,7 +88,16 @@ class CodexRunner:
                 reasoning_effort=reasoning_effort,
                 workdir=selected_workdir,
                 sandbox_mode=sandbox_mode,
+                json_output=progress_callback is not None,
             )
+            if progress_callback is not None:
+                return self._run_streaming(
+                    command,
+                    prompt,
+                    output_path,
+                    selected_workdir=selected_workdir,
+                    progress_callback=progress_callback,
+                )
             try:
                 completed = subprocess.run(
                     command,
@@ -118,6 +136,101 @@ class CodexRunner:
                 returncode=completed.returncode,
                 stderr=completed.stderr.strip(),
             )
+
+    def _run_streaming(
+        self,
+        command: list[str],
+        prompt: str,
+        output_path: Path,
+        *,
+        selected_workdir: Path,
+        progress_callback: Callable[[dict[str, object]], None],
+    ) -> CodexResult:
+        stderr_path = output_path.with_name("stderr.txt")
+        event_queue: queue.Queue[str] = queue.Queue()
+        deadline = time.monotonic() + self._settings.codex_timeout_seconds
+        with stderr_path.open("w+", encoding="utf-8") as stderr_file:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr_file,
+                    text=True,
+                    cwd=str(selected_workdir),
+                )
+            except Exception as exc:
+                return CodexResult(
+                    text=f"Codex failed to start: {exc}",
+                    returncode=1,
+                    stderr=str(exc),
+                )
+
+            assert process.stdin is not None
+            process.stdin.write(prompt)
+            process.stdin.close()
+
+            def read_stdout() -> None:
+                if process.stdout is None:
+                    return
+                for line in process.stdout:
+                    event_queue.put(line)
+
+            reader = threading.Thread(target=read_stdout, daemon=True)
+            reader.start()
+            timed_out = False
+            while process.poll() is None or not event_queue.empty():
+                if time.monotonic() > deadline and process.poll() is None:
+                    timed_out = True
+                    process.kill()
+                    break
+                try:
+                    line = event_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                self._handle_json_event_line(line, progress_callback)
+
+            reader.join(timeout=1)
+            while not event_queue.empty():
+                self._handle_json_event_line(event_queue.get(), progress_callback)
+            returncode = process.wait(timeout=5)
+            stderr_file.seek(0)
+            stderr = stderr_file.read().strip()
+
+        if timed_out:
+            return CodexResult(
+                text=(
+                    "Codex timed out after "
+                    f"{self._settings.codex_timeout_seconds} seconds. "
+                    "Try a narrower request or increase CODEX_TIMEOUT_SECONDS."
+                ),
+                returncode=124,
+                stderr=stderr,
+            )
+
+        output_text = ""
+        if output_path.exists():
+            output_text = output_path.read_text(encoding="utf-8", errors="replace").strip()
+        if returncode != 0:
+            error = stderr or output_text or "Codex exited with an error."
+            output_text = f"Codex failed with exit code {returncode}.\n\n{error}"
+        return CodexResult(
+            text=output_text or EMPTY_CODEX_RESPONSE,
+            returncode=returncode,
+            stderr=stderr,
+        )
+
+    @staticmethod
+    def _handle_json_event_line(
+        line: str,
+        progress_callback: Callable[[dict[str, object]], None],
+    ) -> None:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if isinstance(event, dict):
+            progress_callback(event)
 
     def compact(
         self,
