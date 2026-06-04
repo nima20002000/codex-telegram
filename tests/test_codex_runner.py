@@ -210,6 +210,29 @@ class CodexRunnerTests(unittest.TestCase):
             self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
             self.assertNotIn("--sandbox", command)
 
+    def test_runner_applies_per_run_extra_args(self):
+        with TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            seen: dict[str, object] = {}
+
+            def fake_run(command, **kwargs):
+                seen["command"] = command
+                output_path = Path(command[command.index("--output-last-message") + 1])
+                output_path.write_text("final answer", encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with patch("subprocess.run", side_effect=fake_run):
+                CodexRunner(self._settings(workdir)).run(
+                    "do work",
+                    sandbox_mode="read-only",
+                    extra_args=("--skip-git-repo-check",),
+                )
+
+            command = seen["command"]
+            self.assertIsInstance(command, list)
+            assert isinstance(command, list)
+            self.assertIn("--skip-git-repo-check", command)
+
     def test_runner_streams_json_events_and_reads_last_message(self):
         with TemporaryDirectory() as tmp:
             workdir = Path(tmp)

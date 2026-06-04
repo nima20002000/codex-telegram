@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -33,6 +34,7 @@ class FakeTelegram:
         self.fail_chat_action = False
         self.fail_create_forum_topic = False
         self.fail_topic_lifecycle = False
+        self.fail_get_chat = False
         self.fail_group_metadata = False
 
     def send_message(self, chat_id, text, *, reply_to_message_id=None, message_thread_id=None, reply_markup=None):
@@ -69,8 +71,8 @@ class FakeTelegram:
         self.deleted_forum_topics.append((chat_id, message_thread_id))
 
     def get_chat(self, chat_id):
-        if self.fail_group_metadata:
-            raise TelegramAPIError("missing group admin permission")
+        if self.fail_get_chat:
+            raise TelegramAPIError("temporary getChat failure")
         return self.chat_info
 
     def set_chat_title(self, chat_id, title):
@@ -99,11 +101,17 @@ class FakeCodex:
     def __init__(self, response="done"):
         self.prompts: list[str] = []
         self.runs: list[tuple[str | None, str | None, Path | None, str | None]] = []
+        self.extra_args: list[tuple[str, ...]] = []
         self.compact_prompts: list[str] = []
         self.compact_runs: list[tuple[str | None, str | None, Path | None, str | None]] = []
         self.compact_response = "compacted summary"
         self.compact_returncode = 0
-        self.response = response
+        if isinstance(response, list):
+            self.responses = list(response)
+            self.response = response[-1] if response else "done"
+        else:
+            self.responses = []
+            self.response = response
         self.emit_progress = False
 
     def run(
@@ -114,10 +122,12 @@ class FakeCodex:
         reasoning_effort=None,
         workdir=None,
         sandbox_mode=None,
+        extra_args=(),
         progress_callback=None,
     ):
         self.prompts.append(prompt)
         self.runs.append((model, reasoning_effort, workdir, sandbox_mode))
+        self.extra_args.append(tuple(extra_args))
         if self.emit_progress and progress_callback is not None:
             progress_callback(
                 {
@@ -129,7 +139,8 @@ class FakeCodex:
                     },
                 }
             )
-        return CodexResult(text=self.response, returncode=0, stderr="")
+        text = self.responses.pop(0) if self.responses else self.response
+        return CodexResult(text=text, returncode=0, stderr="")
 
     def compact(
         self,
@@ -186,6 +197,13 @@ class NoLowModelCatalog(FakeModelCatalog):
         )
 
 
+class SparseEffortModelCatalog(FakeModelCatalog):
+    def __init__(self):
+        self.models = (
+            ModelChoice("gpt-tiny", "GPT Tiny", ("minimal", "none"), "minimal"),
+        )
+
+
 class GatewayTests(unittest.TestCase):
     def _settings(
         self,
@@ -193,6 +211,7 @@ class GatewayTests(unittest.TestCase):
         *,
         allowed_users=frozenset({42}),
         codex_sandbox="workspace-write",
+        max_telegram_response_chars=12000,
     ) -> Settings:
         return Settings(
             bot_token="token",
@@ -207,7 +226,7 @@ class GatewayTests(unittest.TestCase):
             codex_timeout_seconds=10,
             telegram_poll_timeout_seconds=30,
             telegram_request_timeout_seconds=45,
-            max_telegram_response_chars=12000,
+            max_telegram_response_chars=max_telegram_response_chars,
             session_history_turns=8,
             state_dir=workdir / ".state",
         )
@@ -244,6 +263,26 @@ class GatewayTests(unittest.TestCase):
             chat_type="private",
             message_thread_id=message_thread_id,
         )
+
+    def _create_action(
+        self,
+        workspace: str,
+        *,
+        model: str = "gpt-5.5",
+        effort: str = "high",
+        sandbox: str = "yolo",
+        topic_name: str | None = None,
+    ) -> str:
+        payload = {
+            "action": "create_topic_session",
+            "workspace": workspace,
+            "model": model,
+            "reasoning_effort": effort,
+            "sandbox_mode": sandbox,
+        }
+        if topic_name is not None:
+            payload["topic_name"] = topic_name
+        return json.dumps(payload)
 
     def test_help_command_does_not_run_codex(self):
         with TemporaryDirectory() as tmp:
@@ -1466,13 +1505,18 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(session.compact_metadata, {})
             self.assertEqual(session.goal_metadata, {})
 
-    def test_general_forum_message_creates_configured_topic_session(self):
+    def test_general_controller_creates_configured_topic_session(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             kitia = root / "kitia"
             kitia.mkdir()
             telegram = FakeTelegram()
-            codex = FakeCodex("finished")
+            codex = FakeCodex(
+                [
+                    self._create_action("kitia", topic_name="kitia | gpt-5.5 high | yolo"),
+                    "Topic agent ready. Send the task here.",
+                ]
+            )
             store = SessionStore(root / ".state")
             gateway = CodexTelegramGateway(
                 settings=self._settings(root),
@@ -1484,7 +1528,7 @@ class GatewayTests(unittest.TestCase):
 
             gateway.handle_message(
                 self._message(
-                    "make me a session in kitia folder with gpt 5.5 high in yolo mode",
+                    "Hey can you make me a new topic with gpt 5.5 high in kitia yolo",
                     chat_id="-1001",
                     chat_type="supergroup",
                 )
@@ -1492,7 +1536,10 @@ class GatewayTests(unittest.TestCase):
 
             topic_key = "-1001:thread:50"
             self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
-            self.assertEqual(codex.prompts, [])
+            self.assertEqual(len(codex.prompts), 2)
+            self.assertIn("General-chat controller", codex.prompts[0])
+            self.assertIn("Current General-chat message:", codex.prompts[0])
+            self.assertIn("topic-scoped Codex agent", codex.prompts[1])
             self.assertEqual(store.load_active_workspace(topic_key), "kitia")
             self.assertEqual(store.load_sandbox_mode(topic_key), "yolo")
             preference = store.load_model_preference(topic_key)
@@ -1507,11 +1554,841 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(topic_session.model, "gpt-5.5")
             self.assertEqual(topic_session.reasoning_effort, "high")
             self.assertEqual(topic_session.sandbox_mode, "yolo")
-            self.assertIn("Session ready.", telegram.messages[0][1])
-            self.assertIn(f"Workspace: {kitia.resolve()}", telegram.messages[0][1])
+            self.assertEqual(codex.runs[0][0:2], (None, None))
+            self.assertNotEqual(codex.runs[0][2], root.resolve())
+            self.assertEqual(codex.runs[0][3], "read-only")
+            self.assertEqual(codex.extra_args[0], ("--skip-git-repo-check",))
+            self.assertEqual(codex.runs[1], ("gpt-5.5", "high", kitia.resolve(), "read-only"))
+            self.assertEqual(codex.extra_args[1], ())
+            self.assertIn("Topic agent ready", telegram.messages[0][1])
             self.assertEqual(telegram.message_threads[0], 50)
             self.assertIn("Created topic `kitia | gpt-5.5 high | yolo`", telegram.messages[1][1])
             self.assertEqual(telegram.message_threads[1], None)
+
+    def test_topic_agent_intro_is_truncated_to_telegram_limit(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kitia = root / "kitia"
+            kitia.mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                [
+                    self._create_action("kitia", topic_name="kitia | gpt-5.5 high | yolo"),
+                    "a" * 13000,
+                ]
+            )
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root, max_telegram_response_chars=40),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in kitia with gpt 5.5 high yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertLess(len(telegram.messages[0][1]), 13000)
+            self.assertIn("[Response truncated by MAX_TELEGRAM_RESPONSE_CHARS.]", telegram.messages[0][1])
+            self.assertEqual(store.load("-1001:thread:50")[0].text, telegram.messages[0][1])
+
+    def test_topic_agent_fallback_intro_is_saved_to_history(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                [
+                    self._create_action("kitia", topic_name="kitia | gpt-5.5 high | yolo"),
+                    "",
+                ]
+            )
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root, max_telegram_response_chars=40),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in kitia with gpt 5.5 high yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            history = store.load("-1001:thread:50")
+            self.assertEqual(len(history), 1)
+            self.assertEqual(history[0].role, "assistant")
+            self.assertIn("Session ready", history[0].text)
+            self.assertIn("[Response truncated by MAX_TELEGRAM_RESPONSE_CHARS.]", history[0].text)
+            self.assertEqual(history[0].text, telegram.messages[0][1])
+
+    def test_general_controller_ignores_controller_supplied_topic_title(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kitia = root / "kitia"
+            kitia.mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                [
+                    self._create_action("kitia", topic_name="Injected Title"),
+                    "Topic agent ready.",
+                ]
+            )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in kitia with gpt 5.5 high yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
+
+    def test_general_controller_accepts_root_workspace_typo_in_visible_request(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                [
+                    self._create_action(".", effort="medium", sandbox="yolo", topic_name="desktop | gpt-5.5 medium | yolo"),
+                    "Topic agent ready.",
+                ]
+            )
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "Hey can you make me a new topic with gpt 5.5 medium in deaktop yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [("-1001", f"{root.name} | gpt-5.5 medium | yolo")])
+            topic_session = store.load_topic_session("-1001:thread:50")
+            self.assertIsNotNone(topic_session)
+            assert topic_session is not None
+            self.assertEqual(topic_session.workspace, "")
+            self.assertEqual(topic_session.reasoning_effort, "medium")
+            self.assertEqual(topic_session.sandbox_mode, "yolo")
+
+    def test_general_controller_rejects_root_workspace_alias_inside_path(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex(self._create_action(".", effort="high", sandbox="yolo"))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in Desktop/kitia with gpt 5.5 high yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [])
+            self.assertIn("workspace", telegram.messages[-1][1])
+
+    def test_general_controller_rejects_root_word_alias_inside_path(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex(self._create_action(".", effort="high", sandbox="yolo"))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in root/kitia with gpt 5.5 high yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [])
+            self.assertIn("workspace", telegram.messages[-1][1])
+
+    def test_general_controller_rejects_hyphenated_root_alias_path(self):
+        for visible_workspace in ("root-kitia", "Desktop-kitia", "deaktop-kitia"):
+            with self.subTest(visible_workspace=visible_workspace):
+                with TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    telegram = FakeTelegram()
+                    codex = FakeCodex(self._create_action(".", effort="high", sandbox="yolo"))
+                    gateway = CodexTelegramGateway(
+                        settings=self._settings(root),
+                        telegram=telegram,
+                        codex=codex,
+                        model_catalog=FakeModelCatalog(),
+                        sessions=SessionStore(root / ".state"),
+                    )
+
+                    gateway.handle_message(
+                        self._message(
+                            f"make a new topic in {visible_workspace} with gpt 5.5 high yolo",
+                            chat_id="-1001",
+                            chat_type="supergroup",
+                        )
+                    )
+
+                    self.assertEqual(telegram.created_topics, [])
+                    self.assertIn("workspace", telegram.messages[-1][1])
+
+    def test_general_controller_accepts_i_need_a_new_topic_create_intent(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                [
+                    self._create_action("kitia", topic_name="kitia | gpt-5.5 high | yolo"),
+                    "Topic agent ready.",
+                ]
+            )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "I need a new topic in kitia with gpt 5.5 high yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
+
+    def test_general_controller_accepts_dot_root_workspace_in_visible_request(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                [
+                    self._create_action(".", topic_name="root | gpt-5.5 high | yolo"),
+                    "Topic agent ready.",
+                ]
+            )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in . with gpt 5.5 high yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [("-1001", f"{root.name} | gpt-5.5 high | yolo")])
+
+    def test_general_controller_prefers_real_workspace_named_desktop_over_root_alias(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            desktop = root / "desktop"
+            desktop.mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                [
+                    self._create_action("desktop", topic_name="desktop | gpt-5.5 high | yolo"),
+                    "Topic agent ready.",
+                ]
+            )
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in desktop with gpt 5.5 high yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(store.load_active_workspace("-1001:thread:50"), "desktop")
+            self.assertEqual(codex.runs[1][2], desktop.resolve())
+
+    def test_general_controller_prefers_capitalized_real_workspace_over_root_alias(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            desktop = root / "desktop"
+            desktop.mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                [
+                    self._create_action("Desktop", topic_name="desktop | gpt-5.5 high | yolo"),
+                    "Topic agent ready.",
+                ]
+            )
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in Desktop with gpt 5.5 high yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(store.load_active_workspace("-1001:thread:50"), "desktop")
+            self.assertEqual(codex.runs[1][2], desktop.resolve())
+
+    def test_general_controller_create_action_requires_visible_settings(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(self._create_action("kitia", topic_name="kitia | gpt-5.5 high | yolo"))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "please create a new topic",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [])
+            self.assertIn("workspace", telegram.messages[-1][1])
+            self.assertIn("model", telegram.messages[-1][1])
+            self.assertIn("thinking", telegram.messages[-1][1])
+            self.assertIn("sandbox", telegram.messages[-1][1])
+
+    def test_general_controller_accepts_catalog_specific_visible_reasoning_effort(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                [
+                    self._create_action(
+                        "kitia",
+                        model="gpt-tiny",
+                        effort="minimal",
+                        topic_name="kitia | gpt-tiny minimal | yolo",
+                    ),
+                    "Topic agent ready.",
+                ]
+            )
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=SparseEffortModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in kitia with gpt tiny minimal yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-tiny minimal | yolo")])
+            self.assertIn("gpt-tiny: efforts=minimal, none", codex.prompts[0])
+            self.assertIn("selected model's listed reasoning efforts", codex.prompts[0])
+            topic_session = store.load_topic_session("-1001:thread:50")
+            self.assertIsNotNone(topic_session)
+            assert topic_session is not None
+            self.assertEqual(topic_session.reasoning_effort, "minimal")
+
+    def test_general_controller_rejects_controller_model_prefix_mismatch(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                self._create_action(
+                    "kitia",
+                    model="gpt-5.4",
+                    effort="high",
+                    sandbox="yolo",
+                    topic_name="kitia | gpt-5.4 high | yolo",
+                )
+            )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=PrefixModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in kitia with gpt 5.4 mini high yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [])
+            self.assertIn("model", telegram.messages[-1][1])
+
+    def test_general_controller_rejects_controller_model_substring_mismatch(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                self._create_action(
+                    "kitia",
+                    model="gpt-5.4-mini",
+                    effort="high",
+                    sandbox="yolo",
+                    topic_name="kitia | gpt-5.4-mini high | yolo",
+                )
+            )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=PrefixModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in kitia with gpt 5.4 minimal high yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [])
+            self.assertIn("model", telegram.messages[-1][1])
+
+    def test_general_controller_rejects_controller_effort_substring_mismatch(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                self._create_action(
+                    "kitia",
+                    effort="high",
+                    sandbox="yolo",
+                    topic_name="kitia | gpt-5.5 high | yolo",
+                )
+            )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in kitia with gpt 5.5 xhigh yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [])
+            self.assertIn("thinking", telegram.messages[-1][1])
+
+    def test_general_controller_rejects_split_xhigh_as_visible_high_for_model_without_xhigh(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                self._create_action(
+                    "kitia",
+                    model="gpt-5.4-mini",
+                    effort="high",
+                    sandbox="yolo",
+                    topic_name="kitia | gpt-5.4-mini high | yolo",
+                )
+            )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=PrefixModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in kitia with gpt 5.4 mini x high yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [])
+            self.assertIn("thinking", telegram.messages[-1][1])
+
+    def test_general_controller_rejects_negated_yolo_for_yolo_sandbox(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(self._create_action("kitia", effort="high", sandbox="yolo"))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in kitia with gpt 5.5 high do not use the yolo sandbox",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [])
+            self.assertIn("sandbox", telegram.messages[-1][1])
+
+    def test_general_controller_accepts_negated_yolo_as_constrained_sandbox(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                [
+                    self._create_action("kitia", effort="high", sandbox="constrained"),
+                    "Topic agent ready.",
+                ]
+            )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in kitia with gpt 5.5 high not yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | constrained")])
+
+    def test_general_controller_rejects_never_use_yolo_for_yolo_sandbox(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(self._create_action("kitia", effort="high", sandbox="yolo"))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in kitia with gpt 5.5 high never use yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [])
+            self.assertIn("sandbox", telegram.messages[-1][1])
+
+    def test_general_controller_rejects_avoid_bypass_for_yolo_sandbox(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(self._create_action("kitia", effort="high", sandbox="yolo"))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in kitia with gpt 5.5 high avoid bypass",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [])
+            self.assertIn("sandbox", telegram.messages[-1][1])
+
+    def test_general_controller_rejects_avoid_using_bypass_for_yolo_sandbox(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(self._create_action("kitia", effort="high", sandbox="yolo"))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in kitia with gpt 5.5 high avoid using bypass",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [])
+            self.assertIn("sandbox", telegram.messages[-1][1])
+
+    def test_non_forum_supergroup_message_uses_regular_codex_session(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            telegram.chat_info = ChatInfo(title="Plain Group", chat_type="supergroup", is_forum=False)
+            codex = FakeCodex("regular group response")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message("hello there", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.created_topics, [])
+            self.assertEqual(telegram.messages[-1][1], "regular group response")
+            self.assertNotIn("General-chat controller", codex.prompts[0])
+
+    def test_general_forum_metadata_failure_does_not_fall_through_or_cache_false(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            telegram.fail_get_chat = True
+            codex = FakeCodex("regular group response")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message("hello there", chat_id="-1001", chat_type="supergroup")
+            )
+            telegram.fail_get_chat = False
+            gateway.handle_message(
+                self._message("hello there", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(len(codex.prompts), 1)
+            self.assertIn("could not verify", telegram.messages[0][1])
+            self.assertIn("General-chat controller", codex.prompts[0])
+
+    def test_general_controller_does_not_treat_workspace_write_as_root_workspace(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex(self._create_action(".", sandbox="constrained", topic_name="root | gpt-5.5 high | constrained"))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "create a new topic with gpt 5.5 high workspace write",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [])
+            self.assertIn("workspace", telegram.messages[-1][1])
+
+    def test_general_controller_nested_workspace_requires_visible_relative_path(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "prod" / "app").mkdir(parents=True)
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                self._create_action("prod/app", topic_name="prod/app | gpt-5.5 high | yolo")
+            )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in app with gpt 5.5 high yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [])
+            self.assertIn("workspace", telegram.messages[-1][1])
+
+    def test_general_controller_lists_and_accepts_visible_nested_workspace(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nested = root / "prod" / "app"
+            nested.mkdir(parents=True)
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                [
+                    self._create_action("prod/app", topic_name="prod/app | gpt-5.5 high | yolo"),
+                    "Topic agent ready.",
+                ]
+            )
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in prod/app with gpt 5.5 high yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertIn("- prod/app", codex.prompts[0])
+            self.assertEqual(store.load_active_workspace("-1001:thread:50"), "prod/app")
+            self.assertEqual(codex.runs[1][2], nested.resolve())
+
+    def test_general_controller_lists_direct_workspaces_before_nested_limit(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            early = root / "aaa"
+            early.mkdir()
+            for index in range(250):
+                (early / f"nested-{index:03d}").mkdir()
+            target = root / "zzz-target"
+            target.mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                [
+                    self._create_action("zzz-target", topic_name="zzz-target | gpt-5.5 high | yolo"),
+                    "Topic agent ready.",
+                ]
+            )
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in zzz-target with gpt 5.5 high yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertIn("- zzz-target", codex.prompts[0])
+            self.assertEqual(store.load_active_workspace("-1001:thread:50"), "zzz-target")
 
     def test_general_forum_message_reports_group_and_topic_metadata_without_ids(self):
         with TemporaryDirectory() as tmp:
@@ -1532,7 +2409,7 @@ class GatewayTests(unittest.TestCase):
             gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
-                codex=FakeCodex(),
+                codex=FakeCodex(json.dumps({"action": "report_metadata"})),
                 model_catalog=FakeModelCatalog(),
                 sessions=store,
             )
@@ -1551,14 +2428,78 @@ class GatewayTests(unittest.TestCase):
             self.assertNotIn("-1001", text)
             self.assertNotIn("thread", text.lower())
 
+    def test_general_controller_metadata_requires_visible_intent(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex(json.dumps({"action": "report_metadata"}))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message("hello there", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertNotIn("Group metadata:", telegram.messages[-1][1])
+            self.assertIn("For safety", telegram.messages[-1][1])
+
+    def test_general_controller_metadata_ignores_quoted_shortcut_text(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex(json.dumps({"action": "report_metadata"}))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "summarize this text: show metadata",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertNotIn("Group metadata:", telegram.messages[-1][1])
+            self.assertIn("For safety", telegram.messages[-1][1])
+
+    def test_general_controller_preserves_metadata_shortcut_phrase(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex(json.dumps({"action": "report_metadata"}))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message("group metadata", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertIn("Group metadata:", telegram.messages[-1][1])
+
     def test_general_forum_message_renames_group_explicitly(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
+            codex = FakeCodex(json.dumps({"action": "rename_group", "title": "Temporary Dev Group"}))
             gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
-                codex=FakeCodex(),
+                codex=codex,
                 model_catalog=FakeModelCatalog(),
                 sessions=SessionStore(root / ".state"),
             )
@@ -1570,15 +2511,170 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(telegram.group_renames, [("-1001", "Temporary Dev Group")])
             self.assertIn("Renamed group to `Temporary Dev Group`.", telegram.messages[-1][1])
 
+    def test_general_forum_group_rename_uses_literal_visible_title(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex(json.dumps({"action": "rename_group", "title": "my project"}))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message("rename group to My Project", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.group_renames, [("-1001", "My Project")])
+            self.assertIn("Renamed group to `My Project`.", telegram.messages[-1][1])
+
+    def test_general_controller_group_rename_requires_visible_title(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex(json.dumps({"action": "rename_group", "title": "Hidden Title"}))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message("rename group", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.group_renames, [])
+            self.assertIn("group rename explicitly", telegram.messages[-1][1])
+
+    def test_general_controller_group_rename_requires_exact_visible_title(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex(json.dumps({"action": "rename_group", "title": "Dev"}))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message("rename group to Development", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.group_renames, [])
+            self.assertIn("exact new group title", telegram.messages[-1][1])
+
+    def test_general_controller_group_rename_accepts_unicode_title(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            title = "گروه تست"
+            codex = FakeCodex(json.dumps({"action": "rename_group", "title": title}))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(f"rename group to {title}", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.group_renames, [("-1001", title)])
+
+    def test_general_controller_group_rename_rejects_partial_unicode_title(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex(json.dumps({"action": "rename_group", "title": "گروه"}))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message("rename group to گروه تست", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.group_renames, [])
+            self.assertIn("exact new group title", telegram.messages[-1][1])
+
+    def test_general_controller_group_rename_rejects_extra_controller_suffix(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex(json.dumps({"action": "rename_group", "title": "Dev 🚨"}))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message("rename group to Dev", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.group_renames, [])
+            self.assertIn("exact new group title", telegram.messages[-1][1])
+
+    def test_general_controller_accepts_explicit_admin_phrasing_with_articles(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=50,
+                session_key="-1001:thread:50",
+                topic_name="kitia topic",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            codex = FakeCodex(json.dumps({"action": "delete_topic", "target": "kitia topic"}))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "please delete the topic kitia topic",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.deleted_forum_topics, [("-1001", 50)])
+
     def test_general_forum_group_rename_reports_permission_failure(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
             telegram.fail_group_metadata = True
+            codex = FakeCodex(json.dumps({"action": "rename_group", "title": "Temporary Dev Group"}))
             gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
-                codex=FakeCodex(),
+                codex=codex,
                 model_catalog=FakeModelCatalog(),
                 sessions=SessionStore(root / ".state"),
             )
@@ -1594,10 +2690,11 @@ class GatewayTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
+            codex = FakeCodex(json.dumps({"action": "rename_group", "title": "a" * 129}))
             gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
-                codex=FakeCodex(),
+                codex=codex,
                 model_catalog=FakeModelCatalog(),
                 sessions=SessionStore(root / ".state"),
             )
@@ -1617,7 +2714,7 @@ class GatewayTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
-            codex = FakeCodex()
+            codex = FakeCodex(json.dumps({"action": "reply", "text": "What group action should I take?"}))
             gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
@@ -1631,8 +2728,8 @@ class GatewayTests(unittest.TestCase):
             )
 
             self.assertEqual(telegram.group_renames, [])
-            self.assertEqual(codex.prompts, [])
-            self.assertIn("General chat is for creating", telegram.messages[-1][1])
+            self.assertEqual(len(codex.prompts), 1)
+            self.assertIn("What group action should I take?", telegram.messages[-1][1])
 
     def test_general_forum_message_renames_recorded_topic_session(self):
         with TemporaryDirectory() as tmp:
@@ -1640,10 +2737,23 @@ class GatewayTests(unittest.TestCase):
             (root / "kitia").mkdir()
             telegram = FakeTelegram()
             store = SessionStore(root / ".state")
+            codex = FakeCodex(
+                [
+                    self._create_action("kitia", topic_name="kitia | gpt-5.5 high | yolo"),
+                    "Topic agent ready.",
+                    json.dumps(
+                        {
+                            "action": "rename_topic",
+                            "target": "kitia | gpt-5.5 high | yolo",
+                            "new_name": "kitia renamed",
+                        }
+                    ),
+                ]
+            )
             gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
-                codex=FakeCodex(),
+                codex=codex,
                 model_catalog=FakeModelCatalog(),
                 sessions=store,
             )
@@ -1657,7 +2767,7 @@ class GatewayTests(unittest.TestCase):
 
             gateway.handle_message(
                 self._message(
-                    "rename topic kitia to kitia renamed",
+                    "rename topic kitia | gpt-5.5 high | yolo to kitia renamed",
                     chat_id="-1001",
                     chat_type="supergroup",
                 )
@@ -1670,16 +2780,70 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(topic_session.topic_name, "kitia renamed")
             self.assertIn("Renamed topic", telegram.messages[-1][1])
 
+    def test_general_forum_topic_rename_uses_literal_visible_new_name(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=50,
+                session_key="-1001:thread:50",
+                topic_name="kitia | gpt-5.5 high | yolo",
+                workspace="kitia",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="yolo",
+            )
+            codex = FakeCodex(
+                json.dumps(
+                    {
+                        "action": "rename_topic",
+                        "target": "kitia | gpt-5.5 high | yolo",
+                        "new_name": "kitia renamed",
+                    }
+                )
+            )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "rename topic kitia | gpt-5.5 high | yolo to Kitia Renamed",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.edited_forum_topics, [("-1001", 50, "Kitia Renamed")])
+            topic_session = store.load_topic_session("-1001:thread:50")
+            self.assertIsNotNone(topic_session)
+            assert topic_session is not None
+            self.assertEqual(topic_session.topic_name, "Kitia Renamed")
+
     def test_general_forum_message_closes_and_reopens_topic_session(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "kitia").mkdir()
             telegram = FakeTelegram()
             store = SessionStore(root / ".state")
+            codex = FakeCodex(
+                [
+                    self._create_action("kitia", topic_name="kitia | gpt-5.5 high | yolo"),
+                    "Topic agent ready.",
+                    json.dumps({"action": "close_topic", "target": "kitia | gpt-5.5 high | yolo"}),
+                    json.dumps({"action": "reopen_topic", "target": "kitia | gpt-5.5 high | yolo"}),
+                ]
+            )
             gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
-                codex=FakeCodex(),
+                codex=codex,
                 model_catalog=FakeModelCatalog(),
                 sessions=store,
             )
@@ -1692,7 +2856,7 @@ class GatewayTests(unittest.TestCase):
             )
 
             gateway.handle_message(
-                self._message("close topic kitia", chat_id="-1001", chat_type="supergroup")
+                self._message("close topic kitia | gpt-5.5 high | yolo", chat_id="-1001", chat_type="supergroup")
             )
             closed_session = store.load_topic_session("-1001:thread:50")
             self.assertIsNotNone(closed_session)
@@ -1700,7 +2864,7 @@ class GatewayTests(unittest.TestCase):
             self.assertTrue(closed_session.is_closed)
 
             gateway.handle_message(
-                self._message("reopen topic kitia", chat_id="-1001", chat_type="supergroup")
+                self._message("reopen topic kitia | gpt-5.5 high | yolo", chat_id="-1001", chat_type="supergroup")
             )
             reopened_session = store.load_topic_session("-1001:thread:50")
             self.assertIsNotNone(reopened_session)
@@ -1715,10 +2879,17 @@ class GatewayTests(unittest.TestCase):
             (root / "kitia").mkdir()
             telegram = FakeTelegram()
             store = SessionStore(root / ".state")
+            codex = FakeCodex(
+                [
+                    self._create_action("kitia", topic_name="kitia | gpt-5.5 high | yolo"),
+                    "Topic agent ready.",
+                    json.dumps({"action": "delete_topic", "target": "kitia | gpt-5.5 high | yolo"}),
+                ]
+            )
             gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
-                codex=FakeCodex(),
+                codex=codex,
                 model_catalog=FakeModelCatalog(),
                 sessions=store,
             )
@@ -1742,7 +2913,7 @@ class GatewayTests(unittest.TestCase):
             )
 
             gateway.handle_message(
-                self._message("delete topic kitia", chat_id="-1001", chat_type="supergroup")
+                self._message("delete topic kitia | gpt-5.5 high | yolo", chat_id="-1001", chat_type="supergroup")
             )
 
             self.assertEqual(telegram.deleted_forum_topics, [("-1001", 50)])
@@ -1755,7 +2926,7 @@ class GatewayTests(unittest.TestCase):
             self.assertTrue((root / "kitia").is_dir())
             self.assertIn("removed only its bridge session state", telegram.messages[-1][1])
 
-    def test_general_forum_lifecycle_rejects_ambiguous_topic_target(self):
+    def test_general_forum_lifecycle_rejects_partial_topic_target(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
@@ -1771,10 +2942,11 @@ class GatewayTests(unittest.TestCase):
                     reasoning_effort="high",
                     sandbox_mode="constrained",
                 )
+            codex = FakeCodex(json.dumps({"action": "close_topic", "target": "kitia"}))
             gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
-                codex=FakeCodex(),
+                codex=codex,
                 model_catalog=FakeModelCatalog(),
                 sessions=store,
             )
@@ -1784,7 +2956,144 @@ class GatewayTests(unittest.TestCase):
             )
 
             self.assertEqual(telegram.closed_forum_topics, [])
-            self.assertIn("ambiguous", telegram.messages[-1][1])
+            self.assertIn("exact recorded topic", telegram.messages[-1][1])
+
+    def test_general_forum_lifecycle_rejects_unique_partial_topic_target(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=50,
+                session_key="-1001:thread:50",
+                topic_name="kitia | gpt-5.5 high | yolo",
+                workspace="kitia",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="yolo",
+            )
+            codex = FakeCodex(json.dumps({"action": "delete_topic", "target": "kitia"}))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message("delete topic kitia", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.deleted_forum_topics, [])
+            self.assertIsNotNone(store.load_topic_session("-1001:thread:50"))
+            self.assertIn("exact recorded topic", telegram.messages[-1][1])
+
+    def test_general_forum_lifecycle_rejects_normalized_topic_title_target(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=50,
+                session_key="-1001:thread:50",
+                topic_name="kitia | gpt-5.5 high | yolo",
+                workspace="kitia",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="yolo",
+            )
+            codex = FakeCodex(json.dumps({"action": "delete_topic", "target": "kitiagpt55highyolo"}))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message("delete topic kitiagpt55highyolo", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.deleted_forum_topics, [])
+            self.assertIsNotNone(store.load_topic_session("-1001:thread:50"))
+            self.assertIn("exact recorded topic", telegram.messages[-1][1])
+
+    def test_general_forum_lifecycle_accepts_exact_numeric_topic_title(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key="-1001:thread:7",
+                topic_name="50",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            codex = FakeCodex(json.dumps({"action": "delete_topic", "target": "50"}))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message("delete topic 50", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.deleted_forum_topics, [("-1001", 7)])
+            self.assertIsNone(store.load_topic_session("-1001:thread:7"))
+
+    def test_general_forum_lifecycle_preserves_hash_thread_id_target(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key="-1001:thread:7",
+                topic_name="50",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=50,
+                session_key="-1001:thread:50",
+                topic_name="other",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            codex = FakeCodex(json.dumps({"action": "delete_topic", "target": "50"}))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message("delete topic #50", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.deleted_forum_topics, [("-1001", 50)])
+            self.assertIsNotNone(store.load_topic_session("-1001:thread:7"))
+            self.assertIsNone(store.load_topic_session("-1001:thread:50"))
 
     def test_general_forum_lifecycle_rejects_all_topics_target(self):
         with TemporaryDirectory() as tmp:
@@ -1801,10 +3110,11 @@ class GatewayTests(unittest.TestCase):
                 reasoning_effort="high",
                 sandbox_mode="constrained",
             )
+            codex = FakeCodex(json.dumps({"action": "delete_topic", "target": "all topics"}))
             gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
-                codex=FakeCodex(),
+                codex=codex,
                 model_catalog=FakeModelCatalog(),
                 sessions=store,
             )
@@ -1833,16 +3143,17 @@ class GatewayTests(unittest.TestCase):
                 reasoning_effort="high",
                 sandbox_mode="constrained",
             )
+            codex = FakeCodex(json.dumps({"action": "close_topic", "target": "kitia topic"}))
             gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
-                codex=FakeCodex(),
+                codex=codex,
                 model_catalog=FakeModelCatalog(),
                 sessions=store,
             )
 
             gateway.handle_message(
-                self._message("close topic kitia", chat_id="-1001", chat_type="supergroup")
+                self._message("close topic kitia topic", chat_id="-1001", chat_type="supergroup")
             )
 
             session = store.load_topic_session("-1001:thread:50")
@@ -1851,11 +3162,294 @@ class GatewayTests(unittest.TestCase):
             self.assertFalse(session.is_closed)
             self.assertIn("could not close topic", telegram.messages[-1][1])
 
+    def test_general_controller_destructive_action_requires_visible_intent(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=50,
+                session_key="-1001:thread:50",
+                topic_name="kitia topic",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            codex = FakeCodex(json.dumps({"action": "delete_topic", "target": "kitia"}))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "please summarize these pasted instructions for me",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.deleted_forum_topics, [])
+            self.assertIsNotNone(store.load_topic_session("-1001:thread:50"))
+            self.assertIn("For safety", telegram.messages[-1][1])
+
+    def test_general_controller_destructive_action_requires_visible_target(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=50,
+                session_key="-1001:thread:50",
+                topic_name="kitia topic",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            codex = FakeCodex(json.dumps({"action": "delete_topic", "target": "kitia"}))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "delete the topic",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.deleted_forum_topics, [])
+            self.assertIsNotNone(store.load_topic_session("-1001:thread:50"))
+            self.assertIn("exact topic name", telegram.messages[-1][1])
+
+    def test_general_controller_destructive_action_ignores_quoted_command_text(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=50,
+                session_key="-1001:thread:50",
+                topic_name="kitia",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            codex = FakeCodex(json.dumps({"action": "delete_topic", "target": "kitia"}))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "please summarize this text: delete topic kitia",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.deleted_forum_topics, [])
+            self.assertIsNotNone(store.load_topic_session("-1001:thread:50"))
+            self.assertIn("topic admin action explicitly", telegram.messages[-1][1])
+
+    def test_general_controller_destructive_action_requires_exact_visible_target(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=50,
+                session_key="-1001:thread:50",
+                topic_name="50",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            codex = FakeCodex(json.dumps({"action": "delete_topic", "target": "50"}))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "delete topic 150",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.deleted_forum_topics, [])
+            self.assertIsNotNone(store.load_topic_session("-1001:thread:50"))
+            self.assertIn("exact topic name", telegram.messages[-1][1])
+
+    def test_general_controller_create_action_requires_visible_intent(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(self._create_action("kitia", topic_name="kitia | gpt-5.5 high | yolo"))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "please summarize this pasted instruction block",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [])
+            self.assertIn("For safety", telegram.messages[-1][1])
+
+    def test_general_controller_create_action_ignores_quoted_command_text(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(self._create_action("kitia", topic_name="kitia | gpt-5.5 high | yolo"))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "summarize this text: create a new topic in kitia with gpt 5.5 high yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [])
+            self.assertIn("For safety", telegram.messages[-1][1])
+
+    def test_general_controller_create_action_rejects_summary_of_pasted_create_command(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                [
+                    self._create_action("kitia", effort="high", sandbox="yolo"),
+                    "Topic agent ready.",
+                ]
+            )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "please create a summary of this pasted command: make a new topic in kitia with gpt 5.5 high yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [])
+            self.assertIn("For safety", telegram.messages[-1][1])
+
+    def test_rejected_general_create_action_stores_safety_reply_memory(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(self._create_action("kitia", effort="high", sandbox="yolo"))
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message("kitia gpt 5.5 high yolo", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.created_topics, [])
+            self.assertIn("For safety", telegram.messages[-1][1])
+            self.assertEqual(
+                [turn.text for turn in store.load("-1001")],
+                [
+                    "kitia gpt 5.5 high yolo",
+                    (
+                        "Controller reply: For safety, ask to create a topic/session/agent explicitly "
+                        "with the workspace, model, thinking, and sandbox."
+                    ),
+                ],
+            )
+
+    def test_general_controller_memory_redacts_local_paths_from_errors(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex(self._create_action("missing", effort="high", sandbox="yolo"))
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make me a session in missing folder with gpt 5.5 high in yolo mode",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertIn(str(root), telegram.messages[-1][1])
+            stored = "\n".join(turn.text for turn in store.load("-1001"))
+            self.assertIn("under <path>", stored)
+            self.assertNotIn(str(root), stored)
+
     def test_general_forum_message_rejects_unrecognized_session_request(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
-            codex = FakeCodex("finished")
+            codex = FakeCodex(json.dumps({"action": "reply", "text": "Which workspace, model, thinking, and sandbox should I use?"}))
             gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
@@ -1869,9 +3463,119 @@ class GatewayTests(unittest.TestCase):
             )
 
             self.assertEqual(telegram.created_topics, [])
-            self.assertEqual(codex.prompts, [])
-            self.assertIn("General chat is for creating", telegram.messages[0][1])
+            self.assertEqual(len(codex.prompts), 1)
+            self.assertIn("Which workspace", telegram.messages[0][1])
             self.assertEqual(telegram.messages[0][2], 9)
+
+    def test_general_controller_memory_redacts_sensitive_values(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                json.dumps(
+                    {
+                        "action": "reply",
+                        "text": (
+                            "I will not store api_hash=abcdefabcdefabcd or "
+                            "/tmp/bot.env or -1001234567890."
+                        ),
+                    }
+                )
+            )
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    (
+                        "token=123456:abcdefghijklmnopqrstuvwxyz1234567890 use /tmp/bot.env and "
+                        "admin.session in -1001234567890 from `/home/example/codex-telegram` "
+                        "and (/tmp)"
+                    ),
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            stored = "\n".join(turn.text for turn in store.load("-1001"))
+            self.assertIn("token=<redacted>", stored)
+            self.assertIn("api_hash=<redacted>", stored)
+            self.assertIn("<env-file>", stored)
+            self.assertIn("<session-file>", stored)
+            self.assertIn("<path>", stored)
+            self.assertIn("<chat>", stored)
+            self.assertNotIn("123456:abcdefghijklmnopqrstuvwxyz1234567890", stored)
+            self.assertNotIn("abcdefabcdefabcd", stored)
+            self.assertNotIn("/tmp/bot.env", stored)
+            self.assertNotIn("admin.session", stored)
+            self.assertNotIn("/home/example/codex-telegram", stored)
+            self.assertNotIn("/tmp", stored)
+            self.assertNotIn("-1001234567890", stored)
+
+    def test_general_controller_prompt_includes_recent_general_context(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                [
+                    json.dumps({"action": "reply", "text": "Which workspace should I use?"}),
+                    json.dumps({"action": "reply", "text": "You asked me to create a topic."}),
+                ]
+            )
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message("please create a new topic", chat_id="-1001", chat_type="supergroup")
+            )
+            gateway.handle_message(
+                self._message("what did I ask you to do?", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertIn("Recent General-chat controller context:", codex.prompts[1])
+            self.assertIn("User: please create a new topic", codex.prompts[1])
+            self.assertIn("Assistant: Controller reply: Which workspace should I use?", codex.prompts[1])
+            self.assertEqual(
+                [turn.text for turn in store.load("-1001")],
+                [
+                    "please create a new topic",
+                    "Controller reply: Which workspace should I use?",
+                    "what did I ask you to do?",
+                    "Controller reply: You asked me to create a topic.",
+                ],
+            )
+
+    def test_general_controller_reply_is_truncated_to_telegram_limit(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex(json.dumps({"action": "reply", "text": "a" * 13000}))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message("hello there", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertLess(len(telegram.messages[0][1]), 13000)
+            self.assertIn("[Response truncated by MAX_TELEGRAM_RESPONSE_CHARS.]", telegram.messages[0][1])
 
     def test_general_forum_message_reports_topic_creation_failure(self):
         with TemporaryDirectory() as tmp:
@@ -1879,7 +3583,7 @@ class GatewayTests(unittest.TestCase):
             (root / "kitia").mkdir()
             telegram = FakeTelegram()
             telegram.fail_create_forum_topic = True
-            codex = FakeCodex("finished")
+            codex = FakeCodex(self._create_action("kitia", topic_name="kitia | gpt-5.5 high | yolo"))
             store = SessionStore(root / ".state")
             gateway = CodexTelegramGateway(
                 settings=self._settings(root),
@@ -1897,7 +3601,7 @@ class GatewayTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(codex.prompts, [])
+            self.assertEqual(len(codex.prompts), 1)
             self.assertEqual(store.load_topic_session("-1001:thread:50"), None)
             self.assertIn("could not create a forum topic", telegram.messages[0][1])
             self.assertEqual(telegram.messages[0][2], 9)
@@ -1908,10 +3612,22 @@ class GatewayTests(unittest.TestCase):
             (root / "kitia").mkdir()
             telegram = FakeTelegram()
             store = SessionStore(root / ".state")
+            codex = FakeCodex(
+                [
+                    self._create_action(
+                        "kitia",
+                        model="gpt-5.4-mini",
+                        effort="high",
+                        sandbox="yolo",
+                        topic_name="kitia | gpt-5.4-mini high | yolo",
+                    ),
+                    "Topic agent ready.",
+                ]
+            )
             gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
-                codex=FakeCodex(),
+                codex=codex,
                 model_catalog=PrefixModelCatalog(),
                 sessions=store,
             )
@@ -1938,7 +3654,13 @@ class GatewayTests(unittest.TestCase):
             other = root / "other"
             other.mkdir()
             telegram = FakeTelegram()
-            codex = FakeCodex("finished")
+            codex = FakeCodex(
+                [
+                    self._create_action("kitia", topic_name="kitia | gpt-5.5 high | yolo"),
+                    "Topic agent ready.",
+                    "finished",
+                ]
+            )
             store = SessionStore(root / ".state")
             gateway = CodexTelegramGateway(
                 settings=self._settings(root),
@@ -1978,7 +3700,22 @@ class GatewayTests(unittest.TestCase):
             salona = root / "salona"
             salona.mkdir()
             telegram = FakeTelegram()
-            codex = FakeCodex("finished")
+            codex = FakeCodex(
+                [
+                    self._create_action("kitia", topic_name="kitia | gpt-5.5 high | yolo"),
+                    "Topic agent ready.",
+                    self._create_action(
+                        "salona",
+                        model="gpt-5.4-mini",
+                        effort="low",
+                        sandbox="constrained",
+                        topic_name="salona | gpt-5.4-mini low | constrained",
+                    ),
+                    "Topic agent ready.",
+                    "finished",
+                    "finished",
+                ]
+            )
             store = SessionStore(root / ".state")
             gateway = CodexTelegramGateway(
                 settings=self._settings(root),
@@ -2032,9 +3769,30 @@ class GatewayTests(unittest.TestCase):
             self.assertNotIn("salona task", codex.prompts[-2])
             self.assertIn("Current Telegram message:\nsalona task", codex.prompts[-1])
             self.assertNotIn("kitia task", codex.prompts[-1])
-            self.assertEqual([turn.text for turn in store.load("-1001:thread:50")], ["kitia task", "finished"])
-            self.assertEqual([turn.text for turn in store.load("-1001:thread:51")], ["salona task", "finished"])
-            self.assertEqual(store.load("-1001"), [])
+            self.assertEqual(
+                [turn.text for turn in store.load("-1001:thread:50")],
+                ["Topic agent ready.", "kitia task", "finished"],
+            )
+            self.assertEqual(
+                [turn.text for turn in store.load("-1001:thread:51")],
+                ["Topic agent ready.", "salona task", "finished"],
+            )
+            general_turns = store.load("-1001")
+            self.assertEqual(
+                [turn.role for turn in general_turns],
+                ["user", "assistant", "user", "assistant"],
+            )
+            self.assertEqual(
+                [turn.text for turn in general_turns if turn.role == "user"],
+                [
+                    "make me a session in kitia folder with gpt 5.5 high in yolo mode",
+                    "make me an agent in salona folder with gpt 5.4 mini low in constrained mode",
+                ],
+            )
+            self.assertTrue(general_turns[1].text.startswith("Controller action succeeded: "))
+            self.assertIn('"workspace": "kitia"', general_turns[1].text)
+            self.assertTrue(general_turns[3].text.startswith("Controller action succeeded: "))
+            self.assertIn('"workspace": "salona"', general_turns[3].text)
 
     def test_forum_topic_model_preference_is_separate_from_group_default(self):
         with TemporaryDirectory() as tmp:

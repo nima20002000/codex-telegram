@@ -35,6 +35,7 @@ class CodexRunner:
         workdir: Path | None = None,
         sandbox_mode: str | None = None,
         json_output: bool = False,
+        extra_args: tuple[str, ...] = (),
     ) -> list[str]:
         selected_workdir = workdir or self._settings.codex_workdir
         args = [
@@ -67,6 +68,8 @@ class CodexRunner:
             args[2:2] = ["--profile", self._settings.codex_profile]
         if self._settings.codex_extra_args:
             args[2:2] = list(self._settings.codex_extra_args)
+        if extra_args:
+            args[2:2] = list(extra_args)
         return args
 
     def run(
@@ -77,6 +80,7 @@ class CodexRunner:
         reasoning_effort: str | None = None,
         workdir: Path | None = None,
         sandbox_mode: str | None = None,
+        extra_args: tuple[str, ...] = (),
         progress_callback: Callable[[dict[str, object]], None] | None = None,
     ) -> CodexResult:
         selected_workdir = workdir or self._settings.codex_workdir
@@ -89,6 +93,7 @@ class CodexRunner:
                 workdir=selected_workdir,
                 sandbox_mode=sandbox_mode,
                 json_output=progress_callback is not None,
+                extra_args=extra_args,
             )
             if progress_callback is not None:
                 return self._run_streaming(

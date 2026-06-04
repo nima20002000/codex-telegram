@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 AUTO_COMPACT_HISTORY_CHARS = 24000
 PROGRESS_MIN_INTERVAL_SECONDS = 5.0
+GENERAL_MEMORY_MAX_CHARS = 500
 REASONING_EFFORT_RANK = {
     "minimal": 0,
     "none": 0,
@@ -49,6 +52,10 @@ BOT_TOKEN_RE = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b")
 PRIVATE_CHAT_ID_RE = re.compile(r"-100\d{6,}")
 ENV_PATH_RE = re.compile(r"\S*\.env(?:\.\S+)?")
 SESSION_PATH_RE = re.compile(r"\S+\.session\b")
+ABSOLUTE_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9:/])/(?:home|tmp|var|etc|usr|opt|root|mnt|media|run|dev|proc|srv)"
+    r"(?:/[A-Za-z0-9._-]+)*"
+)
 
 
 @dataclass(frozen=True)
@@ -80,6 +87,48 @@ class TopicLifecycleRequest:
     new_name: str | None = None
 
 
+@dataclass(frozen=True)
+class GeneralControllerOutcome:
+    handled: bool
+    memory_text: str
+
+
+GENERAL_CONTROLLER_PROMPT = """You are the General-chat controller for a Telegram forum group.
+Your job is to understand the user's natural-language request and choose one safe Telegram bridge action.
+Return only one JSON object. Do not include Markdown, prose, or code fences.
+
+Available actions:
+- create_topic_session: create a new forum topic backed by a topic-scoped Codex agent.
+- rename_topic, close_topic, reopen_topic, delete_topic: manage one recorded topic session.
+- rename_group: rename the Telegram group.
+- report_metadata: show group/session metadata.
+- reply: ask for missing information or answer a General-chat management question.
+
+Action schemas:
+{"action":"create_topic_session","workspace":"<relative workspace or .>","model":"<model slug>","reasoning_effort":"<one listed effort for the selected model>","sandbox_mode":"constrained|yolo"}
+{"action":"rename_topic","target":"<topic name or thread id>","new_name":"<new topic name>"}
+{"action":"close_topic","target":"<topic name or thread id>"}
+{"action":"reopen_topic","target":"<topic name or thread id>"}
+{"action":"delete_topic","target":"<topic name or thread id>"}
+{"action":"rename_group","title":"<new group title>"}
+{"action":"report_metadata"}
+{"action":"reply","text":"<short response>"}
+
+Rules:
+- General chat is a controller only. Do not perform coding work from General chat.
+- If the user asks to create a topic, session, or agent and gives enough settings, use create_topic_session.
+- Treat "topic", "session", and "agent" as equivalent creation language.
+- Correct obvious typos and casual wording when the intended workspace/settings are clear.
+- The root workspace can be represented as ".".
+- If a required setting is missing, return reply with a concise question.
+- Use recent General-chat context to understand follow-up questions.
+- Use only listed workspaces, models, sandbox modes, and the selected model's listed reasoning efforts.
+- The bridge validates that create-session settings are visible in the current user's message.
+- Destructive or administrative actions must match an explicit visible user request.
+- Never include secrets, tokens, private chat ids, or hidden local state.
+"""
+
+
 def sanitize_progress_text(text: str) -> str | None:
     if "```" in text:
         return None
@@ -99,11 +148,28 @@ def sanitize_progress_text(text: str) -> str | None:
     sanitized = PRIVATE_CHAT_ID_RE.sub("<chat>", sanitized)
     sanitized = ENV_PATH_RE.sub("<env-file>", sanitized)
     sanitized = SESSION_PATH_RE.sub("<session-file>", sanitized)
+    sanitized = ABSOLUTE_PATH_RE.sub("<path>", sanitized)
     sanitized = re.sub(r"\s+", " ", sanitized).strip()
     if not sanitized:
         return None
     if len(sanitized) > 240:
         sanitized = sanitized[:237].rstrip() + "..."
+    return sanitized
+
+
+def sanitize_general_memory_text(text: str) -> str:
+    sanitized = " ".join(line.strip() for line in text.splitlines() if line.strip())
+    sanitized = BOT_TOKEN_RE.sub("<redacted-token>", sanitized)
+    sanitized = SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}=<redacted>", sanitized)
+    sanitized = PRIVATE_CHAT_ID_RE.sub("<chat>", sanitized)
+    sanitized = ENV_PATH_RE.sub("<env-file>", sanitized)
+    sanitized = SESSION_PATH_RE.sub("<session-file>", sanitized)
+    sanitized = ABSOLUTE_PATH_RE.sub("<path>", sanitized)
+    sanitized = re.sub(r"\s+", " ", sanitized).strip()
+    if not sanitized:
+        return "<empty>"
+    if len(sanitized) > GENERAL_MEMORY_MAX_CHARS:
+        sanitized = sanitized[: GENERAL_MEMORY_MAX_CHARS - 3].rstrip() + "..."
     return sanitized
 
 
@@ -124,6 +190,7 @@ class CodexTelegramGateway:
         self._sessions = sessions
         self._offset: int | None = None
         self._active_session_keys: set[str] = set()
+        self._chat_is_forum_cache: dict[str, bool] = {}
 
     @staticmethod
     def _session_key(incoming: IncomingMessage | IncomingCallback) -> str:
@@ -220,24 +287,254 @@ class CodexTelegramGateway:
         cleaned = self._clean_workspace_phrase(value)
         if not cleaned:
             return None
+        root = self._settings.codex_workdir.resolve()
         path = self._workspace_path(cleaned)
         if path is not None:
             return path, self._workspace_relative_path(path)
-
-        root = self._settings.codex_workdir.resolve()
         for child in self._child_workspaces(root):
             if child.name.lower() == cleaned.lower():
                 return child.resolve(), self._workspace_relative_path(child)
+        if self._normalize_lookup(cleaned) in {
+            ".",
+            "root",
+            "workspace",
+            "desktop",
+            self._normalize_lookup(root.name),
+        }:
+            return root, ""
         return None
 
-    def _resolve_requested_model(self, text: str) -> ModelChoice | None:
-        normalized_text = self._normalize_lookup(text)
+    def _available_workspace_relatives(self, *, limit: int = 200) -> list[str]:
+        root = self._settings.codex_workdir.resolve()
+        out: list[str] = []
+        queue = self._child_workspaces(root)
+        index = 0
+        while index < len(queue) and len(out) < limit:
+            path = queue[index]
+            index += 1
+            relative = self._workspace_relative_path(path)
+            out.append(relative)
+            queue.extend(self._child_workspaces(path))
+        return out
+
+    def _general_controller_prompt(self, message: IncomingMessage) -> str:
+        root = self._settings.codex_workdir.resolve()
+        workspace_lines = [f"- . -> {root.name}"]
+        for relative in self._available_workspace_relatives():
+            workspace_lines.append(f"- {relative}")
+
+        model_lines = [
+            f"- {model.slug}: efforts={', '.join(model.reasoning_efforts)}"
+            for model in self._model_catalog.list_models()
+        ]
+        session_lines = []
+        for session in self._sessions.list_topic_sessions(message.chat_id):
+            status = "closed" if session.is_closed else "open"
+            session_lines.append(
+                f"- {session.topic_name} [{status}] "
+                f"workspace={session.workspace or '.'} model={session.model} "
+                f"thinking={session.reasoning_effort} sandbox={session.sandbox_mode}"
+            )
+        if not session_lines:
+            session_lines.append("- none")
+
+        parts = [
+            GENERAL_CONTROLLER_PROMPT.strip(),
+            f"Root workspace name: {root.name}",
+            "Available workspaces:\n" + "\n".join(workspace_lines),
+            "Available models:\n" + "\n".join(model_lines),
+            "Recorded topic sessions:\n" + "\n".join(session_lines),
+        ]
+        history = self._sessions.render_recent(message.chat_id)
+        if history:
+            parts.append("Recent General-chat controller context:\n" + history)
+        parts.append(f"Current General-chat message:\n{message.text}")
+        return "\n\n".join(parts)
+
+    def _general_reply_memory_text(self, text: str) -> str:
+        return "Controller reply: " + sanitize_general_memory_text(self._telegram_response_text(text))
+
+    def _general_action_memory_text(self, action_name: str, **values: str) -> str:
+        payload = {
+            key: value
+            for key, value in {"action": action_name, **values}.items()
+            if value
+        }
+        sanitized_payload = {
+            key: sanitize_general_memory_text(value)
+            for key, value in payload.items()
+        }
+        return "Controller action succeeded: " + json.dumps(
+            sanitized_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    @staticmethod
+    def _extract_json_object(text: str) -> dict[str, object] | None:
+        stripped = text.strip()
+        if not stripped:
+            return None
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            start = stripped.find("{")
+            end = stripped.rfind("}")
+            if start == -1 or end == -1 or end <= start:
+                return None
+            try:
+                parsed = json.loads(stripped[start : end + 1])
+            except json.JSONDecodeError:
+                return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def _run_general_controller(self, message: IncomingMessage) -> dict[str, object] | None:
+        preference = self._effective_model_preference(message.chat_id)
+        with tempfile.TemporaryDirectory(prefix="codex-telegram-controller-") as tmpdir:
+            result = self._codex.run(
+                self._general_controller_prompt(message),
+                model=preference.model if preference and preference.model else None,
+                reasoning_effort=preference.reasoning_effort if preference else None,
+                workdir=Path(tmpdir),
+                sandbox_mode="read-only",
+                extra_args=("--skip-git-repo-check",),
+            )
+        if result.returncode != 0:
+            logger.warning("General controller Codex run failed: %s", result.stderr)
+            return None
+        return self._extract_json_object(result.text)
+
+    @staticmethod
+    def _action_text(action: dict[str, object], key: str) -> str | None:
+        value = action.get(key)
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        return value or None
+
+    @staticmethod
+    def _visible_action_allowed(text: str, action_name: str) -> bool:
+        normalized = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+        direct_prefix = r"^(?:please\s+|can\s+you\s+|could\s+you\s+|would\s+you\s+|hey\s+can\s+you\s+|i\s+(?:want|need)\s+(?:you\s+)?to\s+)?"
+        patterns = {
+            "create_topic_session": (
+                direct_prefix
+                + r"\b(?:create|make|start|open|setup|set up)\b\s+"
+                + r"(?:me\s+)?(?:a\s+|an\s+)?(?:new\s+)?(?:topic|session|agent)\b",
+                direct_prefix + r"\bnew\s+(?:topic|session|agent)\b",
+                r"^(?:please\s+)?i\s+(?:want|need)\s+(?:a\s+|an\s+)?(?:new\s+)?(?:topic|session|agent)\b",
+            ),
+            "rename_group": (r"\brename\b.{0,40}\bgroup\b", r"\bchange\b.{0,40}\bgroup name\b"),
+            "rename_topic": (r"\brename\b.{0,80}\btopic\b", r"\bchange\b.{0,80}\btopic name\b"),
+            "close_topic": (r"\bclose\b.{0,80}\btopic\b",),
+            "reopen_topic": (r"\breopen\b.{0,80}\btopic\b",),
+            "delete_topic": (r"\bdelete\b.{0,80}\btopic\b", r"\bremove\b.{0,80}\btopic\b"),
+            "report_metadata": (
+                direct_prefix + r"\breport\b.{0,80}\b(metadata|topics|sessions)\b",
+                direct_prefix + r"\bshow\b.{0,80}\b(metadata|topics|sessions)\b",
+                direct_prefix + r"\blist\b.{0,80}\b(topics|sessions)\b",
+                direct_prefix + r"\b(group|topic|session)\b.{0,20}\bmetadata\b",
+            ),
+        }
+        return any(re.search(pattern, normalized) for pattern in patterns.get(action_name, ()))
+
+    @classmethod
+    def _visible_value_present(cls, text: str, value: str, *, exact: bool = False) -> bool:
+        cleaned = value.strip().strip("'\"`")
+        if cleaned == ".":
+            return re.search(r"(^|\s)\.(\s|$)", text) is not None
+        if exact:
+            if cleaned.isdigit():
+                return re.search(rf"(?<!\d){re.escape(cleaned)}(?!\d)", text) is not None
+            if re.fullmatch(r"[A-Za-z0-9 ]+", cleaned):
+                return cls._visible_token_sequence_present(text, cleaned)
+            return cleaned.casefold() in text.casefold()
+        return cls._visible_token_sequence_present(text, cleaned)
+
+    @staticmethod
+    def _visible_token_sequence_present(text: str, value: str) -> bool:
+        value_tokens = re.findall(r"[a-z0-9]+", value.lower())
+        text_tokens = re.findall(r"[a-z0-9]+", text.lower())
+        if not value_tokens:
+            return value.casefold() in text.casefold()
+        if len(value_tokens) > len(text_tokens):
+            return False
+        width = len(value_tokens)
+        return any(text_tokens[index : index + width] == value_tokens for index in range(len(text_tokens) - width + 1))
+
+    @staticmethod
+    def _clean_visible_admin_value(value: str) -> str:
+        return value.strip().strip("'\"`")
+
+    @classmethod
+    def _same_visible_admin_value(cls, controller_value: str, visible_value: str) -> bool:
+        return cls._clean_visible_admin_value(controller_value).casefold() == cls._clean_visible_admin_value(visible_value).casefold()
+
+    @classmethod
+    def _same_visible_topic_target(cls, controller_value: str, visible_value: str) -> bool:
+        controller = cls._clean_visible_admin_value(controller_value).removeprefix("#")
+        visible = cls._clean_visible_admin_value(visible_value).removeprefix("#")
+        return controller.casefold() == visible.casefold()
+
+    @staticmethod
+    def _admin_command_prefix() -> str:
+        return r"^\s*(?:please\s+|can\s+you\s+|could\s+you\s+|would\s+you\s+|hey\s+can\s+you\s+)?"
+
+    @classmethod
+    def _visible_group_rename_title(cls, text: str) -> str | None:
+        prefix = cls._admin_command_prefix()
+        patterns = (
+            prefix + r"rename\s+(?:the\s+)?group\s+to\s+(.+?)\s*$",
+            prefix + r"change\s+(?:the\s+)?group\s+name\s+to\s+(.+?)\s*$",
+        )
+        for pattern in patterns:
+            match = re.match(pattern, text, flags=re.IGNORECASE)
+            if match is not None:
+                return cls._clean_visible_admin_value(match.group(1))
+        return None
+
+    @classmethod
+    def _visible_topic_lifecycle_values(cls, text: str, action_name: str) -> tuple[str | None, str | None]:
+        prefix = cls._admin_command_prefix()
+        if action_name == "rename_topic":
+            patterns = (
+                prefix + r"rename\s+(?:the\s+)?topic\s+(.+?)\s+to\s+(.+?)\s*$",
+                prefix + r"rename\s+(?:the\s+)?(.+?)\s+topic\s+to\s+(.+?)\s*$",
+                prefix + r"change\s+(?:the\s+)?topic\s+(.+?)\s+name\s+to\s+(.+?)\s*$",
+            )
+            for pattern in patterns:
+                match = re.match(pattern, text, flags=re.IGNORECASE)
+                if match is not None:
+                    return (
+                        cls._clean_visible_admin_value(match.group(1)),
+                        cls._clean_visible_admin_value(match.group(2)),
+                    )
+            return None, None
+
+        verbs = {
+            "close_topic": "close",
+            "reopen_topic": "reopen",
+            "delete_topic": "(?:delete|remove)",
+        }.get(action_name)
+        if verbs is None:
+            return None, None
+        patterns = (
+            prefix + verbs + r"\s+(?:the\s+)?topic\s+(.+?)\s*$",
+            prefix + verbs + r"\s+(?:the\s+)?(.+?)\s+topic\s*$",
+        )
+        for pattern in patterns:
+            match = re.match(pattern, text, flags=re.IGNORECASE)
+            if match is not None:
+                return cls._clean_visible_admin_value(match.group(1)), None
+        return None, None
+
+    def _visible_model_choice(self, text: str) -> ModelChoice | None:
         matches: dict[str, tuple[int, ModelChoice]] = {}
         for model in self._model_catalog.list_models():
             names = {model.slug, model.display_name}
             for name in names:
-                normalized_name = self._normalize_lookup(name)
-                if normalized_name and normalized_name in normalized_text:
+                if self._visible_token_sequence_present(text, name):
+                    normalized_name = self._normalize_lookup(name)
                     current = matches.get(model.slug)
                     if current is None or len(normalized_name) > current[0]:
                         matches[model.slug] = (len(normalized_name), model)
@@ -246,153 +543,150 @@ class CodexTelegramGateway:
             return None
         best_length = max(length for length, _ in matches.values())
         best_matches = [model for length, model in matches.values() if length == best_length]
-        if len(best_matches) != 1:
-            return None
-        return best_matches[0]
+        return best_matches[0] if len(best_matches) == 1 else None
 
     @staticmethod
-    def _extract_reasoning_effort(text: str) -> str | None:
+    def _visible_reasoning_effort(text: str, supported_efforts: tuple[str, ...] | None = None) -> str | None:
         normalized_text = re.sub(r"[^a-z0-9]+", " ", text.lower())
         if re.search(r"\bx\s*high\b|\bxhigh\b", normalized_text):
             return "xhigh"
-        for effort in ("high", "medium", "low"):
-            if re.search(rf"\b{effort}\b", normalized_text):
+        efforts = supported_efforts if supported_efforts is not None else tuple(REASONING_EFFORT_RANK)
+
+        unique_efforts = sorted(set(efforts), key=len, reverse=True)
+        for effort in unique_efforts:
+            if effort == "xhigh":
+                continue
+            normalized_effort = re.sub(r"[^a-z0-9]+", " ", effort.lower()).strip()
+            if not normalized_effort:
+                continue
+            pattern = r"\b" + r"\s+".join(re.escape(part) for part in normalized_effort.split()) + r"\b"
+            if re.search(pattern, normalized_text):
                 return effort
         return None
 
     @staticmethod
-    def _extract_sandbox_mode(text: str) -> str | None:
+    def _visible_sandbox_mode(text: str) -> str | None:
         normalized_text = re.sub(r"[^a-z0-9]+", " ", text.lower())
-        if re.search(r"\byolo\b|\bdanger full access\b|\bbypass\b", normalized_text):
-            return "yolo"
+        negated_yolo = re.search(
+            r"\b(?:not|no|without|disable|disabled|dont|don t|do not|never|avoid)\s+"
+            r"(?:(?:use|using|enable|enabling|turn on|run in|running in|set|setting|choose|choosing|select|selecting)\s+)?"
+            r"(?:(?:the|a|an|sandbox|mode)\s+){0,3}"
+            r"(?:yolo|danger full access|bypass)\b",
+            normalized_text,
+        )
         if re.search(r"\bconstrained\b|\bworkspace write\b|\bsafe\b", normalized_text):
             return "constrained"
+        if negated_yolo:
+            return "constrained"
+        if re.search(r"\byolo\b|\bdanger full access\b|\bbypass\b", normalized_text):
+            return "yolo"
         return None
 
-    def _extract_workspace_phrase(self, text: str) -> str | None:
-        match = re.search(
-            r"\bin\s+(.+?)(?:\s+with\b|\s+using\b|\s+on\b|\s+for\b|$)",
-            text,
-            flags=re.IGNORECASE,
+    @staticmethod
+    def _visible_standalone_alias(text: str, alias: str) -> bool:
+        for match in re.finditer(rf"\b{re.escape(alias)}\b", text, flags=re.IGNORECASE):
+            before_index = match.start() - 1
+            while before_index >= 0 and text[before_index].isspace():
+                before_index -= 1
+            after_index = match.end()
+            while after_index < len(text) and text[after_index].isspace():
+                after_index += 1
+            if before_index >= 0 and text[before_index] in {"/", "\\", "-", "_", "."}:
+                continue
+            if after_index < len(text) and text[after_index] in {"/", "\\", "-", "_", "."}:
+                continue
+            return True
+        return False
+
+    def _visible_root_workspace_present(self, text: str, root: Path) -> bool:
+        if re.search(r"(^|\s)\.(\s|$)", text):
+            return True
+        if any(
+            self._visible_standalone_alias(text, alias)
+            for alias in ("root", "current workspace", "current folder", "current repo", "workspace root")
+        ):
+            return True
+        return any(
+            self._visible_standalone_alias(text, alias)
+            for alias in ("desktop", "deaktop", root.name)
+            if alias
         )
-        if match is None:
-            return None
-        return self._clean_workspace_phrase(match.group(1))
+
+    def _visible_create_settings_missing(
+        self,
+        text: str,
+        request: SessionProvisioningRequest,
+    ) -> list[str]:
+        root = self._settings.codex_workdir.resolve()
+        missing: list[str] = []
+
+        if request.workspace_relative:
+            workspace_aliases = {request.workspace_relative}
+            if "/" not in request.workspace_relative:
+                workspace_aliases.add(Path(request.workspace_relative).name)
+            if not any(self._visible_value_present(text, alias) for alias in workspace_aliases):
+                missing.append("workspace")
+        else:
+            if not self._visible_root_workspace_present(text, root):
+                missing.append("workspace")
+
+        visible_model = self._visible_model_choice(text)
+        if visible_model is None or visible_model.slug != request.model.slug:
+            missing.append("model")
+
+        visible_effort = self._visible_reasoning_effort(text, request.model.reasoning_efforts)
+        if visible_effort != request.reasoning_effort:
+            missing.append("thinking")
+
+        visible_sandbox = self._visible_sandbox_mode(text)
+        if visible_sandbox != request.sandbox_mode:
+            missing.append("sandbox")
+
+        return missing
 
     def _topic_name_for(self, request: SessionProvisioningRequest) -> str:
         workspace = request.workspace_relative or request.workspace_path.name
         name = f"{workspace} | {request.model.slug} {request.reasoning_effort} | {request.sandbox_mode}"
         return name[:128]
 
-    def _parse_session_provisioning_request(self, text: str) -> tuple[SessionProvisioningRequest | None, str | None]:
-        lowered = text.lower()
-        if "session" not in lowered and "agent" not in lowered:
-            return None, (
-                "General chat is for creating and managing Codex sessions. "
-                "Try: make me a session in kitia folder with gpt 5.5 high in yolo mode"
-            )
-
-        workspace_phrase = self._extract_workspace_phrase(text)
-        if workspace_phrase is None:
-            return None, "I need a workspace. Example: make me a session in kitia folder with gpt 5.5 high in yolo mode"
-        workspace = self._resolve_requested_workspace(workspace_phrase)
-        if workspace is None:
-            return None, f"I could not find a workspace named `{workspace_phrase}` under {self._settings.codex_workdir}."
-        workspace_path, workspace_relative = workspace
-
-        model = self._resolve_requested_model(text)
-        if model is None:
-            return None, "I need exactly one available model name, for example `gpt 5.5`."
-
-        reasoning_effort = self._extract_reasoning_effort(text)
-        if reasoning_effort is None:
-            return None, "I need a thinking effort: low, medium, high, or xhigh."
-        if reasoning_effort not in model.reasoning_efforts:
-            return None, f"`{model.slug}` does not support `{reasoning_effort}` thinking."
-
-        sandbox_mode = self._extract_sandbox_mode(text)
-        if sandbox_mode is None:
-            return None, "I need a sandbox mode: constrained or yolo."
-
-        placeholder = SessionProvisioningRequest(
-            workspace_path=workspace_path,
-            workspace_relative=workspace_relative,
-            model=model,
-            reasoning_effort=reasoning_effort,
-            sandbox_mode=sandbox_mode,
-            topic_name="",
-        )
-        return (
-            SessionProvisioningRequest(
-                workspace_path=workspace_path,
-                workspace_relative=workspace_relative,
-                model=model,
-                reasoning_effort=reasoning_effort,
-                sandbox_mode=sandbox_mode,
-                topic_name=self._topic_name_for(placeholder),
-            ),
-            None,
-        )
-
-    def _is_general_forum_message(self, message: IncomingMessage) -> bool:
-        return message.chat_type == "supergroup" and message.message_thread_id is None
-
-    @staticmethod
-    def _parse_group_rename_request(text: str) -> str | None:
-        match = re.fullmatch(r"rename\s+group\s+to\s+(.+)", text.strip(), flags=re.IGNORECASE)
-        if match is None:
+    def _general_forum_status(self, message: IncomingMessage) -> bool | None:
+        if message.chat_type != "supergroup" or message.message_thread_id is not None:
+            return False
+        cached = self._chat_is_forum_cache.get(message.chat_id)
+        if cached is not None:
+            return cached
+        try:
+            is_forum = self._telegram.get_chat(message.chat_id).is_forum
+        except TelegramAPIError:
+            logger.warning("Failed to check Telegram forum metadata chat=%s", message.chat_id, exc_info=True)
             return None
-        return match.group(1).strip().strip("'\"`")
+        self._chat_is_forum_cache[message.chat_id] = is_forum
+        return is_forum
 
-    @staticmethod
-    def _is_metadata_report_request(text: str) -> bool:
-        normalized = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
-        return normalized in {
-            "report metadata",
-            "show metadata",
-            "group metadata",
-            "topic metadata",
-            "session metadata",
-            "list topics",
-            "show topics",
-        }
-
-    def _handle_group_rename_request(self, message: IncomingMessage, title: str) -> bool:
+    def _handle_group_rename_request(self, message: IncomingMessage, title: str) -> GeneralControllerOutcome:
         if not 1 <= len(title) <= 128:
-            self._telegram.send_message(
-                message.chat_id,
-                "Group titles must be 1 to 128 characters.",
-                reply_to_message_id=message.message_id,
-            )
-            return True
+            response = "Group titles must be 1 to 128 characters."
+            self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+            return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
         try:
             self._telegram.set_chat_title(message.chat_id, title)
         except TelegramAPIError:
             logger.warning("Failed to rename Telegram group chat=%s", message.chat_id, exc_info=True)
-            self._telegram.send_message(
-                message.chat_id,
-                "I could not rename the group. Check the bot's group admin permissions.",
-                reply_to_message_id=message.message_id,
-            )
-            return True
-        self._telegram.send_message(
-            message.chat_id,
-            f"Renamed group to `{title}`.",
-            reply_to_message_id=message.message_id,
-        )
-        return True
+            response = "I could not rename the group. Check the bot's group admin permissions."
+            self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+            return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+        response = f"Renamed group to `{title}`."
+        self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+        return GeneralControllerOutcome(True, self._general_action_memory_text("rename_group", title=title))
 
-    def _handle_metadata_report_request(self, message: IncomingMessage) -> bool:
+    def _handle_metadata_report_request(self, message: IncomingMessage) -> GeneralControllerOutcome:
         try:
             chat = self._telegram.get_chat(message.chat_id)
         except TelegramAPIError:
             logger.warning("Failed to fetch Telegram group metadata chat=%s", message.chat_id, exc_info=True)
-            self._telegram.send_message(
-                message.chat_id,
-                "I could not read the group metadata. Check the bot's group admin permissions.",
-                reply_to_message_id=message.message_id,
-            )
-            return True
+            response = "I could not read the group metadata. Check the bot's group admin permissions."
+            self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+            return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
 
         forum = "yes" if chat.is_forum else "no"
         lines = [
@@ -419,35 +713,19 @@ class CodexTelegramGateway:
             "\n".join(lines),
             reply_to_message_id=message.message_id,
         )
-        return True
+        return GeneralControllerOutcome(True, self._general_action_memory_text("report_metadata"))
 
     @staticmethod
     def _clean_topic_phrase(value: str) -> str:
         return value.strip().strip("'\"`")
 
-    def _parse_topic_lifecycle_request(self, text: str) -> TopicLifecycleRequest | None:
-        stripped = text.strip()
-        rename = re.fullmatch(r"rename\s+topic\s+(.+?)\s+to\s+(.+)", stripped, flags=re.IGNORECASE)
-        if rename is not None:
-            return TopicLifecycleRequest(
-                action="rename",
-                target=self._clean_topic_phrase(rename.group(1)),
-                new_name=self._clean_topic_phrase(rename.group(2)),
-            )
-
-        lifecycle = re.fullmatch(
-            r"(close|reopen|delete|remove)\s+topic\s+(.+)",
-            stripped,
-            flags=re.IGNORECASE,
-        )
-        if lifecycle is None:
-            return None
-        action = lifecycle.group(1).lower()
-        if action == "remove":
-            action = "delete"
-        return TopicLifecycleRequest(action=action, target=self._clean_topic_phrase(lifecycle.group(2)))
-
-    def _resolve_topic_session(self, chat_id: str, target: str) -> tuple[TopicSession | None, str | None]:
+    def _resolve_topic_session(
+        self,
+        chat_id: str,
+        target: str,
+        *,
+        allow_partial: bool = True,
+    ) -> tuple[TopicSession | None, str | None]:
         cleaned = self._clean_topic_phrase(target)
         if not cleaned:
             return None, "I need a topic name or thread id."
@@ -458,12 +736,28 @@ class CodexTelegramGateway:
         if not sessions:
             return None, "I do not have any topic-backed sessions recorded for this chat."
 
+        if not allow_partial:
+            literal_matches = [
+                session
+                for session in sessions
+                if self._clean_topic_phrase(session.topic_name).casefold() == cleaned.casefold()
+            ]
+            if len(literal_matches) == 1:
+                return literal_matches[0], None
+            if len(literal_matches) > 1:
+                return None, f"`{cleaned}` matches more than one topic. Use the thread id instead."
+
         thread_id = cleaned.removeprefix("#")
         if thread_id.isdigit():
             matches = [session for session in sessions if session.message_thread_id == int(thread_id)]
             if len(matches) == 1:
                 return matches[0], None
+            if not allow_partial:
+                return None, f"I could not find an exact recorded topic named `{cleaned}` or thread id `{cleaned}`."
             return None, f"I could not find a recorded topic with thread id `{cleaned}`."
+
+        if not allow_partial:
+            return None, f"I could not find an exact recorded topic named `{cleaned}`. Use the full topic title or thread id."
 
         normalized_target = self._normalize_lookup(cleaned)
         exact = [session for session in sessions if self._normalize_lookup(session.topic_name) == normalized_target]
@@ -484,68 +778,68 @@ class CodexTelegramGateway:
         self,
         message: IncomingMessage,
         request: TopicLifecycleRequest,
-    ) -> bool:
-        session, error = self._resolve_topic_session(message.chat_id, request.target)
+        *,
+        exact_target: bool = False,
+    ) -> GeneralControllerOutcome:
+        session, error = self._resolve_topic_session(message.chat_id, request.target, allow_partial=not exact_target)
         if session is None:
+            response = error or "I could not find that topic session."
             self._telegram.send_message(
                 message.chat_id,
-                error or "I could not find that topic session.",
+                response,
                 reply_to_message_id=message.message_id,
             )
-            return True
+            return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
 
         try:
             if request.action == "rename":
                 new_name = self._clean_topic_phrase(request.new_name or "")
                 if not 1 <= len(new_name) <= 128:
-                    self._telegram.send_message(
-                        message.chat_id,
-                        "Topic names must be 1 to 128 characters.",
-                        reply_to_message_id=message.message_id,
-                    )
-                    return True
+                    response = "Topic names must be 1 to 128 characters."
+                    self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                    return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
                 self._telegram.edit_forum_topic(
                     message.chat_id,
                     session.message_thread_id,
                     name=new_name,
                 )
                 self._sessions.update_topic_session_name(session.session_key, new_name)
-                self._telegram.send_message(
-                    message.chat_id,
-                    f"Renamed topic `{session.topic_name}` to `{new_name}`.",
-                    reply_to_message_id=message.message_id,
+                response = f"Renamed topic `{session.topic_name}` to `{new_name}`."
+                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                return GeneralControllerOutcome(
+                    True,
+                    self._general_action_memory_text("rename_topic", target=session.topic_name, new_name=new_name),
                 )
-                return True
 
             if request.action == "close":
                 self._telegram.close_forum_topic(message.chat_id, session.message_thread_id)
                 self._sessions.set_topic_session_closed(session.session_key, True)
-                self._telegram.send_message(
-                    message.chat_id,
-                    f"Closed topic `{session.topic_name}` and marked its session closed.",
-                    reply_to_message_id=message.message_id,
+                response = f"Closed topic `{session.topic_name}` and marked its session closed."
+                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                return GeneralControllerOutcome(
+                    True,
+                    self._general_action_memory_text("close_topic", target=session.topic_name),
                 )
-                return True
 
             if request.action == "reopen":
                 self._telegram.reopen_forum_topic(message.chat_id, session.message_thread_id)
                 self._sessions.set_topic_session_closed(session.session_key, False)
-                self._telegram.send_message(
-                    message.chat_id,
-                    f"Reopened topic `{session.topic_name}`.",
-                    reply_to_message_id=message.message_id,
+                response = f"Reopened topic `{session.topic_name}`."
+                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                return GeneralControllerOutcome(
+                    True,
+                    self._general_action_memory_text("reopen_topic", target=session.topic_name),
                 )
-                return True
 
             if request.action == "delete":
                 self._telegram.delete_forum_topic(message.chat_id, session.message_thread_id)
                 self._sessions.remove_topic_session(session.session_key)
-                self._telegram.send_message(
-                    message.chat_id,
-                    f"Deleted topic `{session.topic_name}` and removed only its bridge session state.",
-                    reply_to_message_id=message.message_id,
+                response = f"Deleted topic `{session.topic_name}` and removed only its bridge session state."
+                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                return GeneralControllerOutcome(
+                    True,
+                    self._general_action_memory_text("delete_topic", target=session.topic_name),
                 )
-                return True
         except TelegramAPIError:
             logger.warning(
                 "Failed Telegram topic lifecycle action=%s chat=%s thread=%s",
@@ -554,53 +848,76 @@ class CodexTelegramGateway:
                 session.message_thread_id,
                 exc_info=True,
             )
-            self._telegram.send_message(
-                message.chat_id,
+            response = (
                 f"I could not {request.action} topic `{session.topic_name}`. "
-                "Check the bot's topic admin permissions and whether the topic still exists.",
-                reply_to_message_id=message.message_id,
+                "Check the bot's topic admin permissions and whether the topic still exists."
             )
-            return True
+            self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+            return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
 
-        self._telegram.send_message(
-            message.chat_id,
-            "I did not recognize that topic lifecycle action.",
-            reply_to_message_id=message.message_id,
+        response = "I did not recognize that topic lifecycle action."
+        self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+        return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+
+    def _topic_agent_intro(
+        self,
+        *,
+        request: SessionProvisioningRequest,
+        session_key: str,
+    ) -> str:
+        prompt = (
+            "You are the topic-scoped Codex agent for a Telegram forum topic.\n"
+            "Write the first message in this new topic. Keep it short.\n"
+            "Say that the session is ready, restate the configured settings below, "
+            "and ask the user to send the actual task in this topic.\n"
+            f"Workspace: {request.workspace_path}\n"
+            f"Model: {request.model.slug}\n"
+            f"Thinking: {request.reasoning_effort}\n"
+            f"Configured sandbox: {request.sandbox_mode}\n"
+            "This introduction is generated read-only, but the saved topic session uses the configured sandbox above.\n"
+            "Do not include code, command output, Markdown tables, secrets, or private IDs."
         )
-        return True
-
-    def _handle_general_forum_message(self, message: IncomingMessage) -> bool:
-        group_title = self._parse_group_rename_request(message.text)
-        if group_title is not None:
-            return self._handle_group_rename_request(message, group_title)
-
-        if self._is_metadata_report_request(message.text):
-            return self._handle_metadata_report_request(message)
-
-        lifecycle_request = self._parse_topic_lifecycle_request(message.text)
-        if lifecycle_request is not None:
-            return self._handle_topic_lifecycle_request(message, lifecycle_request)
-
-        request, error = self._parse_session_provisioning_request(message.text)
-        if request is None:
-            self._telegram.send_message(
-                message.chat_id,
-                error or "I could not understand that session request.",
-                reply_to_message_id=message.message_id,
+        result = self._codex.run(
+            prompt,
+            model=request.model.slug,
+            reasoning_effort=request.reasoning_effort,
+            workdir=request.workspace_path,
+            sandbox_mode="read-only",
+        )
+        text = self._telegram_response_text(result.text)
+        if result.returncode != 0 or not text or text == EMPTY_CODEX_RESPONSE:
+            text = self._telegram_response_text(
+                "Session ready.\n"
+                f"Workspace: {request.workspace_path}\n"
+                f"Model: {request.model.slug}\n"
+                f"Thinking: {request.reasoning_effort}\n"
+                f"Sandbox: {request.sandbox_mode}\n\n"
+                "Send your task in this topic."
             )
-            return True
+        self._sessions.append(session_key, "assistant", text)
+        return text
+
+    def _create_topic_session(
+        self,
+        message: IncomingMessage,
+        request: SessionProvisioningRequest,
+    ) -> GeneralControllerOutcome:
+        topic_name = request.topic_name.strip()[:128]
+        if not topic_name:
+            response = "I need a non-empty topic name for that session."
+            self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+            return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
 
         try:
-            topic = self._telegram.create_forum_topic(message.chat_id, request.topic_name)
+            topic = self._telegram.create_forum_topic(message.chat_id, topic_name)
         except TelegramAPIError:
             logger.warning("Failed to create Telegram forum topic chat=%s", message.chat_id, exc_info=True)
-            self._telegram.send_message(
-                message.chat_id,
+            response = (
                 "I could not create a forum topic for that session. "
-                "Check that topics are enabled and the bot can manage topics.",
-                reply_to_message_id=message.message_id,
+                "Check that topics are enabled and the bot can manage topics."
             )
-            return True
+            self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+            return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
         topic_key = f"{message.chat_id}:thread:{topic.message_thread_id}"
         self._sessions.save_active_workspace(topic_key, request.workspace_relative)
         self._sessions.save_model_preference(
@@ -621,25 +938,192 @@ class CodexTelegramGateway:
             sandbox_mode=request.sandbox_mode,
         )
 
-        ready_text = (
-            "Session ready.\n"
-            f"Workspace: {request.workspace_path}\n"
-            f"Model: {request.model.slug}\n"
-            f"Thinking: {request.reasoning_effort}\n"
-            f"Sandbox: {request.sandbox_mode}\n\n"
-            "Send messages in this topic to talk to this agent."
-        )
+        ready_text = self._topic_agent_intro(request=request, session_key=topic_key)
         self._telegram.send_message(
             message.chat_id,
             ready_text,
             message_thread_id=topic.message_thread_id,
         )
-        self._telegram.send_message(
-            message.chat_id,
-            f"Created topic `{topic.name}` and configured the Codex session there.",
-            reply_to_message_id=message.message_id,
+        response = f"Created topic `{topic.name}` and configured the Codex session there."
+        self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+        return GeneralControllerOutcome(
+            True,
+            self._general_action_memory_text(
+                "create_topic_session",
+                workspace=request.workspace_relative or ".",
+                model=request.model.slug,
+                reasoning_effort=request.reasoning_effort,
+                sandbox_mode=request.sandbox_mode,
+            ),
         )
-        return True
+
+    def _controller_create_request(self, action: dict[str, object]) -> tuple[SessionProvisioningRequest | None, str | None]:
+        workspace_value = self._action_text(action, "workspace")
+        if workspace_value is None:
+            return None, "I need a workspace for the new topic session."
+        workspace = self._resolve_requested_workspace(workspace_value)
+        if workspace is None:
+            return None, f"I could not find a workspace named `{workspace_value}` under {self._settings.codex_workdir}."
+        workspace_path, workspace_relative = workspace
+
+        model_value = self._action_text(action, "model")
+        if model_value is None:
+            return None, "I need a model for the new topic session."
+        model = self._model_catalog.get_model(model_value)
+        if model is None:
+            return None, f"`{model_value}` is not an available model."
+
+        reasoning_effort = self._action_text(action, "reasoning_effort")
+        if reasoning_effort is None:
+            return None, "I need a thinking effort supported by the selected model."
+        if reasoning_effort not in model.reasoning_efforts:
+            return None, f"`{model.slug}` does not support `{reasoning_effort}` thinking."
+
+        sandbox_mode = self._action_text(action, "sandbox_mode")
+        if sandbox_mode not in {"constrained", "yolo"}:
+            return None, "I need a sandbox mode: constrained or yolo."
+
+        placeholder = SessionProvisioningRequest(
+            workspace_path=workspace_path,
+            workspace_relative=workspace_relative,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            sandbox_mode=sandbox_mode,
+            topic_name="",
+        )
+        return (
+            SessionProvisioningRequest(
+                workspace_path=workspace_path,
+                workspace_relative=workspace_relative,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                sandbox_mode=sandbox_mode,
+                topic_name=self._topic_name_for(placeholder),
+            ),
+            None,
+        )
+
+    def _handle_general_controller_action(
+        self,
+        message: IncomingMessage,
+        action: dict[str, object],
+    ) -> GeneralControllerOutcome:
+        action_name = self._action_text(action, "action")
+        if action_name == "create_topic_session":
+            if not self._visible_action_allowed(message.text, action_name):
+                response = (
+                    "For safety, ask to create a topic/session/agent explicitly with the workspace, model, "
+                    "thinking, and sandbox."
+                )
+                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+            request, error = self._controller_create_request(action)
+            if request is None:
+                response = error or "I could not configure that topic session."
+                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+            missing = self._visible_create_settings_missing(message.text, request)
+            if missing:
+                response = "I need the visible request to include: " + ", ".join(missing) + "."
+                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+            return self._create_topic_session(message, request)
+
+        if action_name == "reply":
+            response = self._telegram_response_text(
+                self._action_text(action, "text") or "I need more detail to manage the group."
+            )
+            self._telegram.send_message(
+                message.chat_id,
+                response,
+                reply_to_message_id=message.message_id,
+            )
+            return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+
+        if action_name == "report_metadata":
+            if not self._visible_action_allowed(message.text, action_name):
+                response = "For safety, ask to show or list group/topic/session metadata explicitly."
+                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+            return self._handle_metadata_report_request(message)
+
+        if action_name == "rename_group":
+            visible_title = self._visible_group_rename_title(message.text)
+            if visible_title is None:
+                response = "For safety, ask the group rename explicitly, for example `rename group to <title>`."
+                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+            title = self._action_text(action, "title")
+            if title is None:
+                response = "I need the new group title."
+                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+            if not self._same_visible_admin_value(title, visible_title):
+                response = "For safety, include the exact new group title in your message."
+                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+            return self._handle_group_rename_request(message, visible_title)
+
+        lifecycle_actions = {
+            "rename_topic": "rename",
+            "close_topic": "close",
+            "reopen_topic": "reopen",
+            "delete_topic": "delete",
+        }
+        if action_name in lifecycle_actions:
+            visible_target, visible_new_name = self._visible_topic_lifecycle_values(message.text, action_name)
+            if visible_target is None:
+                response = "For safety, ask the topic admin action explicitly, for example `delete topic <name>`."
+                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+            target = self._action_text(action, "target")
+            if target is None:
+                response = "I need the topic name or thread id."
+                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+            if not self._same_visible_topic_target(target, visible_target):
+                response = "For safety, include the exact topic name or thread id in your message."
+                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+            new_name = self._action_text(action, "new_name")
+            if action_name == "rename_topic" and (
+                new_name is None
+                or visible_new_name is None
+                or not self._same_visible_admin_value(new_name, visible_new_name)
+            ):
+                response = "For safety, include the exact new topic name in your message."
+                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+            request = TopicLifecycleRequest(
+                action=lifecycle_actions[action_name],
+                target=visible_target,
+                new_name=visible_new_name if action_name == "rename_topic" else new_name,
+            )
+            return self._handle_topic_lifecycle_request(message, request, exact_target=True)
+
+        response = (
+            "I could not decide which group action to take. Ask for a topic/session action with workspace, "
+            "model, thinking, and sandbox."
+        )
+        self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+        return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+
+    def _handle_general_forum_message(self, message: IncomingMessage) -> bool:
+        action = self._run_general_controller(message)
+        if action is None:
+            response = "I could not understand the General-chat controller response. Try again with workspace, model, thinking, and sandbox."
+            self._telegram.send_message(
+                message.chat_id,
+                response,
+                reply_to_message_id=message.message_id,
+            )
+            self._sessions.append(message.chat_id, "user", sanitize_general_memory_text(message.text))
+            self._sessions.append(message.chat_id, "assistant", self._general_reply_memory_text(response))
+            return True
+        outcome = self._handle_general_controller_action(message, action)
+        self._sessions.append(message.chat_id, "user", sanitize_general_memory_text(message.text))
+        self._sessions.append(message.chat_id, "assistant", outcome.memory_text)
+        return outcome.handled
 
     def _active_model_preference(self, chat_id: str | None) -> ChatModelPreference | None:
         if chat_id is None:
@@ -708,6 +1192,13 @@ class CodexTelegramGateway:
             fast_mode="on" if fast_mode else "off",
             goal=self._goal_status_label(chat_id),
         )
+
+    def _telegram_response_text(self, text: str) -> str:
+        response = text.strip()
+        if len(response) > self._settings.max_telegram_response_chars:
+            response = response[: self._settings.max_telegram_response_chars].rstrip()
+            response += "\n\n[Response truncated by MAX_TELEGRAM_RESPONSE_CHARS.]"
+        return response
 
     def _is_authorized(self, incoming: IncomingMessage | IncomingCallback) -> bool:
         if self._settings.allowed_chats and incoming.chat_id not in self._settings.allowed_chats:
@@ -1219,7 +1710,15 @@ class CodexTelegramGateway:
             )
             return
 
-        if self._is_general_forum_message(message):
+        forum_status = self._general_forum_status(message)
+        if forum_status is None:
+            self._telegram.send_message(
+                message.chat_id,
+                "I could not verify whether this group has Telegram topics enabled. Try again in a moment.",
+                reply_to_message_id=message.message_id,
+            )
+            return
+        if forum_status:
             if self._handle_general_forum_message(message):
                 return
 
@@ -1252,10 +1751,7 @@ class CodexTelegramGateway:
             )
         finally:
             self._active_session_keys.discard(session_key)
-        response = result.text.strip()
-        if len(response) > self._settings.max_telegram_response_chars:
-            response = response[: self._settings.max_telegram_response_chars].rstrip()
-            response += "\n\n[Response truncated by MAX_TELEGRAM_RESPONSE_CHARS.]"
+        response = self._telegram_response_text(result.text)
         self._sessions.append(session_key, "assistant", response)
         self._telegram.send_message(
             message.chat_id,

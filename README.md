@@ -133,6 +133,14 @@ Telegram conversation context, stores the compact summary locally, clears the
 raw recent history for that topic, and keeps later messages in that topic using
 the compacted context. General chat `/compact` does not compact topic sessions.
 
+In a Telegram forum group, General chat acts as a controller agent. You can ask
+it in natural language to create or manage topic-backed Codex sessions, for
+example asking for a new topic with a workspace, model, thinking amount, and
+sandbox mode. The controller agent converts the request into a validated bridge
+action; the bridge then creates or manages the Telegram topic. When a new topic
+is created, the topic-scoped Codex agent sends the first message in that topic,
+and later messages in that topic route only to that topic's agent session.
+
 `/fast` is also topic-scoped. It keeps the current model and sandbox, but runs
 that topic with the lowest supported reasoning effort until `/fast off` is sent
 or an explicit model/thinking selection is made.
