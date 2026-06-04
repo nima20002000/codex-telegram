@@ -363,6 +363,79 @@ class SessionStore:
         session = self.load_topic_session(session_key)
         return bool(session.fast_mode) if session is not None else False
 
+    def save_goal(
+        self,
+        session_key: str,
+        *,
+        objective: str,
+        created_at: int | None = None,
+    ) -> bool:
+        sessions = self._load_topic_sessions()
+        session = sessions.get(session_key)
+        if not isinstance(session, dict):
+            return False
+        timestamp = int(time.time()) if created_at is None else created_at
+        session["goal_metadata"] = {
+            "objective": objective,
+            "status": "active",
+            "notes": [],
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "completed_at": None,
+        }
+        self._save_topic_sessions(sessions)
+        return True
+
+    def append_goal_note(
+        self,
+        session_key: str,
+        note: str,
+        *,
+        updated_at: int | None = None,
+    ) -> bool:
+        sessions = self._load_topic_sessions()
+        session = sessions.get(session_key)
+        if not isinstance(session, dict):
+            return False
+        goal = session.get("goal_metadata")
+        if not isinstance(goal, dict) or goal.get("status") != "active":
+            return False
+        notes = goal.get("notes", [])
+        if not isinstance(notes, list):
+            notes = []
+        notes = [item for item in notes if isinstance(item, str)]
+        notes.append(note)
+        goal["notes"] = notes[-20:]
+        goal["updated_at"] = int(time.time()) if updated_at is None else updated_at
+        session["goal_metadata"] = goal
+        self._save_topic_sessions(sessions)
+        return True
+
+    def complete_goal(self, session_key: str, *, completed_at: int | None = None) -> bool:
+        sessions = self._load_topic_sessions()
+        session = sessions.get(session_key)
+        if not isinstance(session, dict):
+            return False
+        goal = session.get("goal_metadata")
+        if not isinstance(goal, dict) or goal.get("status") != "active":
+            return False
+        timestamp = int(time.time()) if completed_at is None else completed_at
+        goal["status"] = "completed"
+        goal["updated_at"] = timestamp
+        goal["completed_at"] = timestamp
+        session["goal_metadata"] = goal
+        self._save_topic_sessions(sessions)
+        return True
+
+    def clear_goal(self, session_key: str) -> bool:
+        sessions = self._load_topic_sessions()
+        session = sessions.get(session_key)
+        if not isinstance(session, dict):
+            return False
+        session["goal_metadata"] = {}
+        self._save_topic_sessions(sessions)
+        return True
+
     def save_compact_metadata(
         self,
         session_key: str,

@@ -15,6 +15,7 @@ BOT_COMMANDS = [
     ("/reset", "Reset"),
     ("/compact", "Compact context"),
     ("/fast", "Fast mode"),
+    ("/goal", "Goal tracking"),
     ("/models", "Models"),
     ("/workspace", "Workspace"),
     ("/sandbox", "Sandbox"),

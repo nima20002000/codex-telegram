@@ -115,6 +115,7 @@ deployment check must prove the service is running a specific commit.
 - `/reset`
 - `/compact`
 - `/fast`
+- `/goal`
 - `/models`
 - `/workspace`
 - `/sandbox`
@@ -129,6 +130,13 @@ the compacted context. General chat `/compact` does not compact topic sessions.
 `/fast` is also topic-scoped. It keeps the current model and sandbox, but runs
 that topic with the lowest supported reasoning effort until `/fast off` is sent
 or an explicit model/thinking selection is made.
+
+`/goal` is topic-scoped goal tracking for longer work. Use `/goal <objective>`
+to set a goal, `/goal status` to inspect it, `/goal update <note>` to add
+constraints or progress notes, `/goal complete` to mark it done, `/goal clear`
+to remove it, and `/goal replace <objective>` to replace an active goal. Active
+goals are included in later Codex prompts for that topic, survive `/reset`, and
+stay separate from goals in other topics.
 
 `/workspace` opens an inline folder browser rooted at `CODEX_WORKDIR`. Use folder
 buttons to move into child directories, then press `Start session` to make later

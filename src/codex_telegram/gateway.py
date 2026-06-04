@@ -48,6 +48,7 @@ class GatewayStatus:
     reasoning_effort: str
     sandbox: str
     fast_mode: str
+    goal: str
 
 
 @dataclass(frozen=True)
@@ -366,11 +367,13 @@ class CodexTelegramGateway:
         for session in self._sessions.list_topic_sessions(message.chat_id):
             status = "closed" if session.is_closed else "open"
             workspace = session.workspace or "."
+            goal = session.goal_metadata.get("status") if isinstance(session.goal_metadata, dict) else None
             lines.append(
                 f"- {session.topic_name} [{status}] "
                 f"workspace={workspace} model={session.model} "
                 f"thinking={session.reasoning_effort} sandbox={session.sandbox_mode} "
-                f"fast={'on' if session.fast_mode else 'off'}"
+                f"fast={'on' if session.fast_mode else 'off'} "
+                f"goal={goal if isinstance(goal, str) else 'none'}"
             )
         self._telegram.send_message(
             message.chat_id,
@@ -664,6 +667,7 @@ class CodexTelegramGateway:
             ),
             sandbox=self._sandbox_status_label(chat_id),
             fast_mode="on" if fast_mode else "off",
+            goal=self._goal_status_label(chat_id),
         )
 
     def _is_authorized(self, incoming: IncomingMessage | IncomingCallback) -> bool:
@@ -677,6 +681,7 @@ class CodexTelegramGateway:
         session_key = self._session_key(message)
         history = self._sessions.render_recent(session_key)
         compact_summary = self._compact_summary_for_session(session_key)
+        goal_context = self._goal_context_for_session(session_key)
         topic = (
             f" message_thread_id={message.message_thread_id}"
             if message.message_thread_id is not None
@@ -690,12 +695,51 @@ class CodexTelegramGateway:
             f"sandbox={self._sandbox_status_label(session_key)}"
         )
         parts = [SYSTEM_PROMPT.strip(), identity]
+        if goal_context:
+            parts.append(goal_context)
         if compact_summary:
             parts.append(f"Compacted Telegram conversation context:\n{compact_summary}")
         if history:
             parts.append(history)
         parts.append(f"Current Telegram message:\n{message.text}")
         return "\n\n".join(parts)
+
+    def _goal_metadata_for_session(self, session_key: str | None) -> dict[str, object]:
+        if session_key is None:
+            return {}
+        session = self._sessions.load_topic_session(session_key)
+        if session is None:
+            return {}
+        return session.goal_metadata
+
+    def _goal_status_label(self, session_key: str | None) -> str:
+        goal = self._goal_metadata_for_session(session_key)
+        status = goal.get("status")
+        objective = goal.get("objective")
+        if not isinstance(status, str) or not isinstance(objective, str) or not objective:
+            return "none"
+        return f"{status}: {objective}"
+
+    def _goal_context_for_session(self, session_key: str) -> str:
+        goal = self._goal_metadata_for_session(session_key)
+        if goal.get("status") != "active":
+            return ""
+        objective = goal.get("objective")
+        if not isinstance(objective, str) or not objective.strip():
+            return ""
+        lines = [
+            "Active Telegram goal:",
+            f"Objective: {objective}",
+            "Status: active",
+            "Continue working toward this goal until it is completed or cleared.",
+        ]
+        notes = goal.get("notes", [])
+        if isinstance(notes, list):
+            valid_notes = [note for note in notes if isinstance(note, str) and note.strip()]
+            if valid_notes:
+                lines.append("Goal notes:")
+                lines.extend(f"- {note}" for note in valid_notes[-5:])
+        return "\n".join(lines)
 
     def _compact_summary_for_session(self, session_key: str) -> str:
         session = self._sessions.load_topic_session(session_key)
@@ -707,7 +751,7 @@ class CodexTelegramGateway:
     def _command_response(self, message: IncomingMessage) -> str | None:
         command = message.text.split(maxsplit=1)[0].split("@", 1)[0].lower()
         if command in {"/start", "/help"}:
-            return "/reset\n/compact\n/fast\n/models\n/workspace\n/sandbox"
+            return "/reset\n/compact\n/fast\n/goal\n/models\n/workspace\n/sandbox"
         if command == "/status":
             status = self.status(self._session_key(message))
             return (
@@ -717,12 +761,15 @@ class CodexTelegramGateway:
                 f"Model: {status.model}\n"
                 f"Thinking: {status.reasoning_effort}\n"
                 f"Sandbox: {status.sandbox}\n"
-                f"Fast mode: {status.fast_mode}"
+                f"Fast mode: {status.fast_mode}\n"
+                f"Goal: {status.goal}"
             )
         if command == "/reset":
             session_key = self._session_key(message)
             self._sessions.reset(session_key)
             self._sessions.clear_compact_metadata(session_key)
+            if self._goal_metadata_for_session(session_key).get("status") == "active":
+                return "This chat's bridge history was reset. Active goal was kept; use /goal clear to remove it."
             return "This chat's bridge history was reset."
         return None
 
@@ -771,11 +818,13 @@ class CodexTelegramGateway:
             reply_to_message_id=reply_to_message_id,
             message_thread_id=message.message_thread_id,
         )
+        goal_context = self._goal_context_for_session(session_key)
+        conversation_context = "\n\n".join(part for part in (goal_context, history) if part)
         preference = self._effective_model_preference(session_key)
         self._active_session_keys.add(session_key)
         try:
             result = self._codex.compact(
-                history,
+                conversation_context,
                 existing_summary=self._compact_summary_for_session(session_key),
                 model=preference.model if preference else None,
                 reasoning_effort=preference.reasoning_effort if preference else None,
@@ -820,6 +869,123 @@ class CodexTelegramGateway:
             )
             return
         self._compact_session(message, auto=False, reply_to_message_id=message.message_id)
+
+    def _format_goal_status(self, session_key: str) -> str:
+        goal = self._goal_metadata_for_session(session_key)
+        objective = goal.get("objective")
+        status = goal.get("status")
+        if not isinstance(objective, str) or not isinstance(status, str):
+            return "Goal: none"
+        lines = [f"Goal: {status}", f"Objective: {objective}"]
+        notes = goal.get("notes", [])
+        if isinstance(notes, list):
+            valid_notes = [note for note in notes if isinstance(note, str) and note.strip()]
+            if valid_notes:
+                lines.append("Notes:")
+                lines.extend(f"- {note}" for note in valid_notes[-5:])
+        return "\n".join(lines)
+
+    def _handle_goal_command(self, message: IncomingMessage) -> None:
+        if message.message_thread_id is None:
+            self._telegram.send_message(
+                message.chat_id,
+                "Run /goal inside a recorded Codex session topic. General chat goals do not target topic sessions.",
+                reply_to_message_id=message.message_id,
+            )
+            return
+        session_key = self._session_key(message)
+        if self._sessions.load_topic_session(session_key) is None:
+            self._telegram.send_message(
+                message.chat_id,
+                "Run /goal inside a recorded Codex session topic.",
+                reply_to_message_id=message.message_id,
+                message_thread_id=message.message_thread_id,
+            )
+            return
+
+        parts = message.text.split(maxsplit=1)
+        raw_action = parts[1].strip() if len(parts) > 1 else "status"
+        action, _, remainder = raw_action.partition(" ")
+        action_lower = action.lower()
+
+        if action_lower in {"status", "state"} or not raw_action:
+            self._telegram.send_message(
+                message.chat_id,
+                self._format_goal_status(session_key),
+                reply_to_message_id=message.message_id,
+                message_thread_id=message.message_thread_id,
+            )
+            return
+
+        if action_lower in {"clear", "cancel", "remove"}:
+            self._sessions.clear_goal(session_key)
+            self._telegram.send_message(
+                message.chat_id,
+                "Goal cleared for this topic.",
+                reply_to_message_id=message.message_id,
+                message_thread_id=message.message_thread_id,
+            )
+            return
+
+        if action_lower in {"complete", "done"}:
+            if self._sessions.complete_goal(session_key):
+                response = "Goal marked complete for this topic."
+            else:
+                response = "There is no active goal to complete in this topic."
+            self._telegram.send_message(
+                message.chat_id,
+                response,
+                reply_to_message_id=message.message_id,
+                message_thread_id=message.message_thread_id,
+            )
+            return
+
+        if action_lower in {"update", "note"}:
+            note = remainder.strip()
+            if not note:
+                response = "Use `/goal update <note>` to add progress or constraints."
+            elif self._sessions.append_goal_note(session_key, note):
+                response = "Goal updated for this topic."
+            else:
+                response = "There is no active goal to update in this topic."
+            self._telegram.send_message(
+                message.chat_id,
+                response,
+                reply_to_message_id=message.message_id,
+                message_thread_id=message.message_thread_id,
+            )
+            return
+
+        if action_lower in {"replace", "set"}:
+            objective = remainder.strip()
+            if not objective:
+                response = "Use `/goal set <objective>` to set a topic goal."
+            else:
+                self._sessions.save_goal(session_key, objective=objective)
+                response = "Goal set for this topic."
+            self._telegram.send_message(
+                message.chat_id,
+                response,
+                reply_to_message_id=message.message_id,
+                message_thread_id=message.message_thread_id,
+            )
+            return
+
+        active_goal = self._goal_metadata_for_session(session_key).get("status") == "active"
+        if active_goal:
+            response = (
+                "A goal is already active in this topic. Use `/goal update <note>`, "
+                "`/goal complete`, `/goal clear`, or `/goal replace <objective>`."
+            )
+        else:
+            self._sessions.save_goal(session_key, objective=raw_action)
+            response = "Goal set for this topic."
+        self._telegram.send_message(
+            message.chat_id,
+            response,
+            reply_to_message_id=message.message_id,
+            message_thread_id=message.message_thread_id,
+        )
 
     def _handle_fast_command(self, message: IncomingMessage) -> None:
         if message.message_thread_id is None:
@@ -956,6 +1122,9 @@ class CodexTelegramGateway:
         if command == "/fast":
             self._handle_fast_command(message)
             return
+        if command == "/goal":
+            self._handle_goal_command(message)
+            return
 
         command_response = self._command_response(message)
         if command_response is not None:
@@ -1079,6 +1248,7 @@ class CodexTelegramGateway:
                 self._sessions.save_active_workspace(session_key, self._workspace_relative_path(path))
                 self._sessions.reset(session_key)
                 self._sessions.clear_compact_metadata(session_key)
+                self._sessions.clear_goal(session_key)
                 self._telegram.answer_callback_query(callback.callback_query_id, text="Session started.")
                 status = self.status(session_key)
                 self._reply_to_callback(
@@ -1087,7 +1257,8 @@ class CodexTelegramGateway:
                     f"Model: {status.model}\n"
                     f"Thinking: {status.reasoning_effort}\n"
                     f"Sandbox: {status.sandbox}\n"
-                    f"Fast mode: {status.fast_mode}",
+                    f"Fast mode: {status.fast_mode}\n"
+                    f"Goal: {status.goal}",
                 )
                 return
             self._telegram.answer_callback_query(callback.callback_query_id, text="Unknown action.")

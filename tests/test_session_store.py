@@ -236,6 +236,59 @@ class SessionStoreTests(unittest.TestCase):
             assert session is not None
             self.assertEqual(session.compact_metadata, {})
 
+    def test_topic_goal_metadata_round_trip_update_complete_and_clear(self):
+        with TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            topic_key = "-1001:thread:50"
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=50,
+                session_key=topic_key,
+                topic_name="kitia | gpt-5.5 high | yolo",
+                workspace="kitia",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="yolo",
+            )
+
+            self.assertTrue(store.save_goal(topic_key, objective="ship the feature", created_at=10))
+            self.assertTrue(store.append_goal_note(topic_key, "covered edge cases", updated_at=11))
+            session = store.load_topic_session(topic_key)
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(
+                session.goal_metadata,
+                {
+                    "objective": "ship the feature",
+                    "status": "active",
+                    "notes": ["covered edge cases"],
+                    "created_at": 10,
+                    "updated_at": 11,
+                    "completed_at": None,
+                },
+            )
+
+            self.assertTrue(store.complete_goal(topic_key, completed_at=12))
+            session = store.load_topic_session(topic_key)
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.goal_metadata["status"], "completed")
+            self.assertEqual(session.goal_metadata["completed_at"], 12)
+            self.assertTrue(store.clear_goal(topic_key))
+            session = store.load_topic_session(topic_key)
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.goal_metadata, {})
+
+    def test_topic_goal_metadata_requires_existing_topic_session(self):
+        with TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+
+            self.assertFalse(store.save_goal("missing", objective="ship"))
+            self.assertFalse(store.append_goal_note("missing", "note"))
+            self.assertFalse(store.complete_goal("missing"))
+            self.assertFalse(store.clear_goal("missing"))
+
     def test_compact_metadata_requires_existing_topic_session(self):
         with TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp))

@@ -239,7 +239,7 @@ class GatewayTests(unittest.TestCase):
             gateway.handle_message(self._message("/help"))
 
             self.assertEqual(len(codex.prompts), 0)
-            self.assertEqual(telegram.messages[0][1], "/reset\n/compact\n/fast\n/models\n/workspace\n/sandbox")
+            self.assertEqual(telegram.messages[0][1], "/reset\n/compact\n/fast\n/goal\n/models\n/workspace\n/sandbox")
 
     def test_status_command_shows_status(self):
         with TemporaryDirectory() as tmp:
@@ -260,6 +260,7 @@ class GatewayTests(unittest.TestCase):
             self.assertIn("Model: default", telegram.messages[0][1])
             self.assertIn("Sandbox: configured (workspace-write)", telegram.messages[0][1])
             self.assertIn("Fast mode: off", telegram.messages[0][1])
+            self.assertIn("Goal: none", telegram.messages[0][1])
 
     def test_workspace_command_shows_folder_buttons(self):
         with TemporaryDirectory() as tmp:
@@ -384,6 +385,7 @@ class GatewayTests(unittest.TestCase):
             self.assertIn("Model: gpt-5.5", telegram.edits[1][2])
             self.assertIn("Sandbox: configured (workspace-write)", telegram.edits[1][2])
             self.assertIn("Fast mode: off", telegram.edits[1][2])
+            self.assertIn("Goal: none", telegram.edits[1][2])
             self.assertEqual(codex.runs[-1], ("gpt-5.5", "xhigh", avatar.resolve(), None))
             self.assertNotIn("old context", codex.prompts[-1])
 
@@ -884,6 +886,206 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual([turn.text for turn in store.load(topic_key)], ["continue after compaction", "after compact"])
             self.assertIn("compacted summary", codex.prompts[-1])
 
+    def test_goal_command_in_topic_sets_status_and_prompt_context(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            topic_key = "-1001:thread:7"
+            telegram = FakeTelegram()
+            codex = FakeCodex("goal response")
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key=topic_key,
+                topic_name="kitia topic",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("/goal ship the topic feature", chat_id="-1001", message_thread_id=7))
+            gateway.handle_message(self._message("/goal status", chat_id="-1001", message_thread_id=7))
+            gateway.handle_message(self._message("continue work", chat_id="-1001", message_thread_id=7))
+
+            session = store.load_topic_session(topic_key)
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.goal_metadata["objective"], "ship the topic feature")
+            self.assertEqual(session.goal_metadata["status"], "active")
+            self.assertIn("Goal: active", telegram.messages[-2][1])
+            self.assertIn("Objective: ship the topic feature", telegram.messages[-2][1])
+            self.assertIn("Active Telegram goal", codex.prompts[-1])
+            self.assertIn("ship the topic feature", codex.prompts[-1])
+
+    def test_goal_command_is_topic_scoped_and_general_chat_does_not_mutate_topics(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            for thread_id in (7, 8):
+                store.save_topic_session(
+                    chat_id="-1001",
+                    message_thread_id=thread_id,
+                    session_key=f"-1001:thread:{thread_id}",
+                    topic_name=f"topic {thread_id}",
+                    workspace="",
+                    model="gpt-5.5",
+                    reasoning_effort="high",
+                    sandbox_mode="constrained",
+                )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("/goal first topic goal", chat_id="-1001", message_thread_id=7))
+            gateway.handle_message(self._message("/goal", chat_id="-1001", chat_type="supergroup"))
+            gateway.handle_message(self._message("/status", chat_id="-1001", message_thread_id=7))
+            gateway.handle_message(self._message("/status", chat_id="-1001", message_thread_id=8))
+
+            seven = store.load_topic_session("-1001:thread:7")
+            eight = store.load_topic_session("-1001:thread:8")
+            self.assertIsNotNone(seven)
+            self.assertIsNotNone(eight)
+            assert seven is not None and eight is not None
+            self.assertEqual(seven.goal_metadata["objective"], "first topic goal")
+            self.assertEqual(eight.goal_metadata, {})
+            self.assertIn("General chat goals do not target topic sessions", telegram.messages[-3][1])
+            self.assertIn("Goal: active: first topic goal", telegram.messages[-2][1])
+            self.assertIn("Goal: none", telegram.messages[-1][1])
+
+    def test_goal_update_complete_clear_and_active_goal_guard(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            topic_key = "-1001:thread:7"
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key=topic_key,
+                topic_name="topic",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("/goal first goal", chat_id="-1001", message_thread_id=7))
+            gateway.handle_message(self._message("/goal second goal", chat_id="-1001", message_thread_id=7))
+            gateway.handle_message(self._message("/goal update check edge cases", chat_id="-1001", message_thread_id=7))
+            gateway.handle_message(self._message("/goal complete", chat_id="-1001", message_thread_id=7))
+            gateway.handle_message(self._message("/goal clear", chat_id="-1001", message_thread_id=7))
+
+            self.assertIn("already active", telegram.messages[-4][1])
+            self.assertIn("Goal updated", telegram.messages[-3][1])
+            self.assertIn("Goal marked complete", telegram.messages[-2][1])
+            self.assertIn("Goal cleared", telegram.messages[-1][1])
+            session = store.load_topic_session(topic_key)
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.goal_metadata, {})
+
+    def test_reset_preserves_active_goal_but_clears_history_and_compact_summary(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            topic_key = "-1001:thread:7"
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key=topic_key,
+                topic_name="topic",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            store.save_goal(topic_key, objective="keep goal", created_at=1)
+            store.save_compact_metadata(
+                topic_key,
+                summary="old compact",
+                source_char_count=10,
+                turns_compacted=1,
+                auto=False,
+                compacted_at=1,
+            )
+            store.append(topic_key, "user", "old history")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("/reset", chat_id="-1001", message_thread_id=7))
+
+            session = store.load_topic_session(topic_key)
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(store.load(topic_key), [])
+            self.assertEqual(session.compact_metadata, {})
+            self.assertEqual(session.goal_metadata["objective"], "keep goal")
+            self.assertIn("Active goal was kept", telegram.messages[-1][1])
+
+    def test_compact_includes_active_goal_and_preserves_goal_metadata(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            topic_key = "-1001:thread:7"
+            telegram = FakeTelegram()
+            codex = FakeCodex("after compact")
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key=topic_key,
+                topic_name="topic",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            store.save_goal(topic_key, objective="preserve active goal", created_at=1)
+            store.append(topic_key, "user", "x" * 25000)
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("continue after compaction", chat_id="-1001", message_thread_id=7))
+
+            self.assertIn("Active Telegram goal", codex.compact_prompts[-1])
+            self.assertIn("preserve active goal", codex.compact_prompts[-1])
+            self.assertIn("Active Telegram goal", codex.prompts[-1])
+            session = store.load_topic_session(topic_key)
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.goal_metadata["status"], "active")
+            self.assertEqual(session.goal_metadata["objective"], "preserve active goal")
+
     def test_fast_command_in_topic_lowers_reasoning_without_changing_model_or_sandbox(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1168,6 +1370,7 @@ class GatewayTests(unittest.TestCase):
                 auto=False,
                 compacted_at=1,
             )
+            store.save_goal(topic_key, objective="stale goal", created_at=1)
             gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
@@ -1186,6 +1389,7 @@ class GatewayTests(unittest.TestCase):
             self.assertIsNotNone(session)
             assert session is not None
             self.assertEqual(session.compact_metadata, {})
+            self.assertEqual(session.goal_metadata, {})
 
     def test_general_forum_message_creates_configured_topic_session(self):
         with TemporaryDirectory() as tmp:
@@ -1268,6 +1472,7 @@ class GatewayTests(unittest.TestCase):
             self.assertIn("Forum topics enabled: yes", text)
             self.assertIn("Recorded topic sessions: 1", text)
             self.assertIn("kitia | gpt-5.5 high | yolo [closed]", text)
+            self.assertIn("goal=none", text)
             self.assertNotIn("-1001", text)
             self.assertNotIn("thread", text.lower())
 
