@@ -286,6 +286,87 @@ class CodexTelegramGateway:
         return message.chat_type == "supergroup" and message.message_thread_id is None
 
     @staticmethod
+    def _parse_group_rename_request(text: str) -> str | None:
+        match = re.fullmatch(r"rename\s+group\s+to\s+(.+)", text.strip(), flags=re.IGNORECASE)
+        if match is None:
+            return None
+        return match.group(1).strip().strip("'\"`")
+
+    @staticmethod
+    def _is_metadata_report_request(text: str) -> bool:
+        normalized = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+        return normalized in {
+            "report metadata",
+            "show metadata",
+            "group metadata",
+            "topic metadata",
+            "session metadata",
+            "list topics",
+            "show topics",
+        }
+
+    def _handle_group_rename_request(self, message: IncomingMessage, title: str) -> bool:
+        if not 1 <= len(title) <= 128:
+            self._telegram.send_message(
+                message.chat_id,
+                "Group titles must be 1 to 128 characters.",
+                reply_to_message_id=message.message_id,
+            )
+            return True
+        try:
+            self._telegram.set_chat_title(message.chat_id, title)
+        except TelegramAPIError:
+            logger.warning("Failed to rename Telegram group chat=%s", message.chat_id, exc_info=True)
+            self._telegram.send_message(
+                message.chat_id,
+                "I could not rename the group. Check the bot's group admin permissions.",
+                reply_to_message_id=message.message_id,
+            )
+            return True
+        self._telegram.send_message(
+            message.chat_id,
+            f"Renamed group to `{title}`.",
+            reply_to_message_id=message.message_id,
+        )
+        return True
+
+    def _handle_metadata_report_request(self, message: IncomingMessage) -> bool:
+        try:
+            chat = self._telegram.get_chat(message.chat_id)
+        except TelegramAPIError:
+            logger.warning("Failed to fetch Telegram group metadata chat=%s", message.chat_id, exc_info=True)
+            self._telegram.send_message(
+                message.chat_id,
+                "I could not read the group metadata. Check the bot's group admin permissions.",
+                reply_to_message_id=message.message_id,
+            )
+            return True
+
+        forum = "yes" if chat.is_forum else "no"
+        lines = [
+            "Group metadata:",
+            f"Title: {chat.title or 'unknown'}",
+            f"Type: {chat.chat_type or 'unknown'}",
+            f"Forum topics enabled: {forum}",
+            "",
+            f"Recorded topic sessions: {len(self._sessions.list_topic_sessions(message.chat_id))}",
+        ]
+        for session in self._sessions.list_topic_sessions(message.chat_id):
+            status = "closed" if session.is_closed else "open"
+            workspace = session.workspace or "."
+            lines.append(
+                f"- {session.topic_name} [{status}] "
+                f"workspace={workspace} model={session.model} "
+                f"thinking={session.reasoning_effort} sandbox={session.sandbox_mode}"
+            )
+        self._telegram.send_message(
+            message.chat_id,
+            "\n".join(lines),
+            reply_to_message_id=message.message_id,
+        )
+        return True
+
+    @staticmethod
     def _clean_topic_phrase(value: str) -> str:
         return value.strip().strip("'\"`")
 
@@ -434,6 +515,13 @@ class CodexTelegramGateway:
         return True
 
     def _handle_general_forum_message(self, message: IncomingMessage) -> bool:
+        group_title = self._parse_group_rename_request(message.text)
+        if group_title is not None:
+            return self._handle_group_rename_request(message, group_title)
+
+        if self._is_metadata_report_request(message.text):
+            return self._handle_metadata_report_request(message)
+
         lifecycle_request = self._parse_topic_lifecycle_request(message.text)
         if lifecycle_request is not None:
             return self._handle_topic_lifecycle_request(message, lifecycle_request)

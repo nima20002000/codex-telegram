@@ -9,7 +9,7 @@ from codex_telegram.config import Settings
 from codex_telegram.gateway import CodexTelegramGateway
 from codex_telegram.model_catalog import ModelChoice
 from codex_telegram.session_store import SessionStore
-from codex_telegram.telegram_api import ForumTopic, IncomingCallback, IncomingMessage, TelegramAPIError
+from codex_telegram.telegram_api import ChatInfo, ForumTopic, IncomingCallback, IncomingMessage, TelegramAPIError
 
 
 class FakeTelegram:
@@ -22,6 +22,8 @@ class FakeTelegram:
         self.closed_forum_topics: list[tuple[str, int]] = []
         self.reopened_forum_topics: list[tuple[str, int]] = []
         self.deleted_forum_topics: list[tuple[str, int]] = []
+        self.chat_info = ChatInfo(title="Dev Group", chat_type="supergroup", is_forum=True)
+        self.group_renames: list[tuple[str, str]] = []
         self.next_thread_id = 50
         self.edits: list[tuple[str, int, str, dict | None]] = []
         self.callback_answers: list[tuple[str, str | None]] = []
@@ -31,6 +33,7 @@ class FakeTelegram:
         self.fail_chat_action = False
         self.fail_create_forum_topic = False
         self.fail_topic_lifecycle = False
+        self.fail_group_metadata = False
 
     def send_message(self, chat_id, text, *, reply_to_message_id=None, message_thread_id=None, reply_markup=None):
         self.messages.append((chat_id, text, reply_to_message_id))
@@ -64,6 +67,16 @@ class FakeTelegram:
         if self.fail_topic_lifecycle:
             raise TelegramAPIError("missing topic admin permission")
         self.deleted_forum_topics.append((chat_id, message_thread_id))
+
+    def get_chat(self, chat_id):
+        if self.fail_group_metadata:
+            raise TelegramAPIError("missing group admin permission")
+        return self.chat_info
+
+    def set_chat_title(self, chat_id, title):
+        if self.fail_group_metadata:
+            raise TelegramAPIError("missing group admin permission")
+        self.group_renames.append((chat_id, title))
 
     def edit_message_text(self, chat_id, message_id, text, *, reply_markup=None):
         self.edits.append((chat_id, message_id, text, reply_markup))
@@ -595,6 +608,126 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(telegram.message_threads[0], 50)
             self.assertIn("Created topic `kitia | gpt-5.5 high | yolo`", telegram.messages[1][1])
             self.assertEqual(telegram.message_threads[1], None)
+
+    def test_general_forum_message_reports_group_and_topic_metadata_without_ids(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=50,
+                session_key="-1001:thread:50",
+                topic_name="kitia | gpt-5.5 high | yolo",
+                workspace="kitia",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="yolo",
+            )
+            store.set_topic_session_closed("-1001:thread:50", True)
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message("report metadata", chat_id="-1001", chat_type="supergroup")
+            )
+
+            text = telegram.messages[-1][1]
+            self.assertIn("Group metadata:", text)
+            self.assertIn("Title: Dev Group", text)
+            self.assertIn("Forum topics enabled: yes", text)
+            self.assertIn("Recorded topic sessions: 1", text)
+            self.assertIn("kitia | gpt-5.5 high | yolo [closed]", text)
+            self.assertNotIn("-1001", text)
+            self.assertNotIn("thread", text.lower())
+
+    def test_general_forum_message_renames_group_explicitly(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message("rename group to Temporary Dev Group", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.group_renames, [("-1001", "Temporary Dev Group")])
+            self.assertIn("Renamed group to `Temporary Dev Group`.", telegram.messages[-1][1])
+
+    def test_general_forum_group_rename_reports_permission_failure(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            telegram.fail_group_metadata = True
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message("rename group to Temporary Dev Group", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.group_renames, [])
+            self.assertIn("could not rename the group", telegram.messages[-1][1])
+
+    def test_general_forum_group_rename_rejects_overlong_title(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message(
+                    f"rename group to {'a' * 129}",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.group_renames, [])
+            self.assertIn("Group titles must be 1 to 128 characters.", telegram.messages[-1][1])
+
+    def test_general_forum_group_admin_text_must_be_explicit(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex()
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message("please think about renaming the group", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.group_renames, [])
+            self.assertEqual(codex.prompts, [])
+            self.assertIn("General chat is for creating", telegram.messages[-1][1])
 
     def test_general_forum_message_renames_recorded_topic_session(self):
         with TemporaryDirectory() as tmp:

@@ -19,6 +19,13 @@ class ForumTopic:
 
 
 @dataclass(frozen=True)
+class ChatInfo:
+    title: str
+    chat_type: str
+    is_forum: bool
+
+
+@dataclass(frozen=True)
 class IncomingMessage:
     update_id: int
     chat_id: str
@@ -171,6 +178,23 @@ class TelegramAPI:
                 ],
             },
         )
+
+    def get_chat(self, chat_id: str) -> ChatInfo:
+        payload = self._request("getChat", {"chat_id": chat_id})
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            raise TelegramAPIError(f"Telegram getChat returned unexpected result: {payload}")
+        title = result.get("title")
+        chat_type = result.get("type")
+        is_forum = result.get("is_forum")
+        return ChatInfo(
+            title=title if isinstance(title, str) else "",
+            chat_type=chat_type if isinstance(chat_type, str) else "",
+            is_forum=is_forum if isinstance(is_forum, bool) else False,
+        )
+
+    def set_chat_title(self, chat_id: str, title: str) -> None:
+        self._request("setChatTitle", {"chat_id": chat_id, "title": title})
 
     def create_forum_topic(self, chat_id: str, name: str) -> ForumTopic:
         payload = self._request("createForumTopic", {"chat_id": chat_id, "name": name})

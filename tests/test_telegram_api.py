@@ -113,6 +113,40 @@ class TelegramAPITests(unittest.TestCase):
             ],
         )
 
+    def test_group_metadata_methods_send_expected_requests(self):
+        telegram = RecordingTelegramAPI()
+        telegram.responses["getChat"] = {
+            "ok": True,
+            "result": {"title": "Dev Group", "type": "supergroup", "is_forum": True},
+        }
+
+        chat = telegram.get_chat("-1001")
+        telegram.set_chat_title("-1001", "Renamed Group")
+
+        self.assertEqual(chat.title, "Dev Group")
+        self.assertEqual(chat.chat_type, "supergroup")
+        self.assertTrue(chat.is_forum)
+        self.assertEqual(
+            telegram.requests,
+            [
+                ("getChat", {"chat_id": "-1001"}),
+                ("setChatTitle", {"chat_id": "-1001", "title": "Renamed Group"}),
+            ],
+        )
+
+    def test_get_chat_treats_missing_forum_flag_as_false(self):
+        telegram = RecordingTelegramAPI()
+        telegram.responses["getChat"] = {
+            "ok": True,
+            "result": {"title": "Plain Group", "type": "supergroup"},
+        }
+
+        chat = telegram.get_chat("-1001")
+
+        self.assertEqual(chat.title, "Plain Group")
+        self.assertEqual(chat.chat_type, "supergroup")
+        self.assertFalse(chat.is_forum)
+
     def test_topic_lifecycle_methods_send_expected_requests(self):
         telegram = RecordingTelegramAPI()
 
