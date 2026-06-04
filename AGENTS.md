@@ -82,6 +82,15 @@ because a foreground bridge is running from this checkout, pass
 
 Recent commits use short imperative subjects, for example `Add Telegram model picker` and `Fix stale Codex model preferences`. Keep commits scoped to one behavior change and include tests or a clear reason tests were not run. Pull requests should describe the runtime impact, list validation commands, and mention any configuration or systemd changes. Include screenshots only for Telegram UI-visible command or button changes.
 
+## Release Workflow
+
+Use `RELEASE.md` for the release gate. The package version lives in both
+`pyproject.toml` and `src/codex_telegram/__init__.py`; keep them synchronized.
+Tags use `v<version>`, for example `v0.2.0`. A feature branch may merge to
+`main` only after tests pass, `git diff --check` is clean, the nested Codex
+review loop is clean, manual Telegram E2E passes, and Linear has the evidence.
+After merge/tag, return to a feature branch for the next task.
+
 ## Security & Configuration Tips
 
 Never commit bot tokens, user IDs from private chats, `.env`, or `.codex-telegram/` state. When editing systemd service files, keep absolute paths and `CODEX_COMMAND` behavior clear because user services may not inherit shell-managed paths.

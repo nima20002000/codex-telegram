@@ -202,6 +202,12 @@ running without sandboxing. Use it only for chats and workspaces you trust.
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
+## Release
+
+Release gates, version bump rules, manual Telegram E2E expectations, merge/tag
+commands, installed-service update steps, and rollback notes are documented in
+`RELEASE.md`.
+
 ## Notes
 
 This bridge keeps the Telegram-to-Codex control path in a focused local repo. The agent side is Codex CLI, so the bot can work in whatever `CODEX_WORKDIR` points at.
