@@ -183,6 +183,30 @@ class TelegramAPI:
             raise TelegramAPIError(f"Telegram createForumTopic returned incomplete result: {payload}")
         return ForumTopic(message_thread_id=message_thread_id, name=topic_name)
 
+    def edit_forum_topic(self, chat_id: str, message_thread_id: int, *, name: str) -> None:
+        self._request(
+            "editForumTopic",
+            {"chat_id": chat_id, "message_thread_id": message_thread_id, "name": name},
+        )
+
+    def close_forum_topic(self, chat_id: str, message_thread_id: int) -> None:
+        self._request(
+            "closeForumTopic",
+            {"chat_id": chat_id, "message_thread_id": message_thread_id},
+        )
+
+    def reopen_forum_topic(self, chat_id: str, message_thread_id: int) -> None:
+        self._request(
+            "reopenForumTopic",
+            {"chat_id": chat_id, "message_thread_id": message_thread_id},
+        )
+
+    def delete_forum_topic(self, chat_id: str, message_thread_id: int) -> None:
+        self._request(
+            "deleteForumTopic",
+            {"chat_id": chat_id, "message_thread_id": message_thread_id},
+        )
+
     def send_message(
         self,
         chat_id: str,

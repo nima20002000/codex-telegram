@@ -32,6 +32,7 @@ class TopicSession:
     model: str
     reasoning_effort: str
     sandbox_mode: str
+    is_closed: bool
 
 
 def _safe_chat_key(chat_id: str) -> str:
@@ -180,6 +181,13 @@ class SessionStore:
         preferences[chat_id] = mode
         self._save_string_map(self._sandbox_preferences_path, preferences)
 
+    def clear_sandbox_mode(self, chat_id: str) -> None:
+        preferences = self._load_string_map(self._sandbox_preferences_path)
+        if chat_id not in preferences:
+            return
+        del preferences[chat_id]
+        self._save_string_map(self._sandbox_preferences_path, preferences)
+
     def _load_string_map(self, path: Path) -> dict[str, str]:
         if not path.exists():
             return {}
@@ -255,6 +263,7 @@ class SessionStore:
             "model": model,
             "reasoning_effort": reasoning_effort,
             "sandbox_mode": sandbox_mode,
+            "is_closed": False,
         }
         self._save_topic_sessions(sessions)
 
@@ -269,6 +278,7 @@ class SessionStore:
         model = raw.get("model")
         reasoning_effort = raw.get("reasoning_effort")
         sandbox_mode = raw.get("sandbox_mode")
+        is_closed = raw.get("is_closed", False)
         if not (
             isinstance(chat_id, str)
             and isinstance(message_thread_id, int)
@@ -277,6 +287,7 @@ class SessionStore:
             and isinstance(model, str)
             and isinstance(reasoning_effort, str)
             and isinstance(sandbox_mode, str)
+            and isinstance(is_closed, bool)
         ):
             return None
         return TopicSession(
@@ -288,4 +299,45 @@ class SessionStore:
             model=model,
             reasoning_effort=reasoning_effort,
             sandbox_mode=sandbox_mode,
+            is_closed=is_closed,
         )
+
+    def list_topic_sessions(self, chat_id: str | None = None) -> list[TopicSession]:
+        sessions = []
+        for session_key in self._load_topic_sessions():
+            session = self.load_topic_session(session_key)
+            if session is None:
+                continue
+            if chat_id is not None and session.chat_id != chat_id:
+                continue
+            sessions.append(session)
+        return sorted(sessions, key=lambda session: session.topic_name.lower())
+
+    def update_topic_session_name(self, session_key: str, topic_name: str) -> bool:
+        sessions = self._load_topic_sessions()
+        session = sessions.get(session_key)
+        if not isinstance(session, dict):
+            return False
+        session["topic_name"] = topic_name
+        self._save_topic_sessions(sessions)
+        return True
+
+    def set_topic_session_closed(self, session_key: str, is_closed: bool) -> bool:
+        sessions = self._load_topic_sessions()
+        session = sessions.get(session_key)
+        if not isinstance(session, dict):
+            return False
+        session["is_closed"] = is_closed
+        self._save_topic_sessions(sessions)
+        return True
+
+    def remove_topic_session(self, session_key: str) -> bool:
+        sessions = self._load_topic_sessions()
+        existed = session_key in sessions
+        sessions.pop(session_key, None)
+        self._save_topic_sessions(sessions)
+        self.reset(session_key)
+        self.clear_active_workspace(session_key)
+        self.clear_model_preference(session_key)
+        self.clear_sandbox_mode(session_key)
+        return existed

@@ -9,7 +9,7 @@ from pathlib import Path
 from .codex_runner import CodexRunner
 from .config import Settings
 from .model_catalog import CodexModelCatalog, ModelChoice
-from .session_store import ChatModelPreference, SessionStore
+from .session_store import ChatModelPreference, SessionStore, TopicSession
 from .telegram_api import (
     IncomingCallback,
     IncomingMessage,
@@ -47,6 +47,13 @@ class SessionProvisioningRequest:
     reasoning_effort: str
     sandbox_mode: str
     topic_name: str
+
+
+@dataclass(frozen=True)
+class TopicLifecycleRequest:
+    action: str
+    target: str
+    new_name: str | None = None
 
 
 class CodexTelegramGateway:
@@ -278,7 +285,159 @@ class CodexTelegramGateway:
     def _is_general_forum_message(self, message: IncomingMessage) -> bool:
         return message.chat_type == "supergroup" and message.message_thread_id is None
 
+    @staticmethod
+    def _clean_topic_phrase(value: str) -> str:
+        return value.strip().strip("'\"`")
+
+    def _parse_topic_lifecycle_request(self, text: str) -> TopicLifecycleRequest | None:
+        stripped = text.strip()
+        rename = re.fullmatch(r"rename\s+topic\s+(.+?)\s+to\s+(.+)", stripped, flags=re.IGNORECASE)
+        if rename is not None:
+            return TopicLifecycleRequest(
+                action="rename",
+                target=self._clean_topic_phrase(rename.group(1)),
+                new_name=self._clean_topic_phrase(rename.group(2)),
+            )
+
+        lifecycle = re.fullmatch(
+            r"(close|reopen|delete|remove)\s+topic\s+(.+)",
+            stripped,
+            flags=re.IGNORECASE,
+        )
+        if lifecycle is None:
+            return None
+        action = lifecycle.group(1).lower()
+        if action == "remove":
+            action = "delete"
+        return TopicLifecycleRequest(action=action, target=self._clean_topic_phrase(lifecycle.group(2)))
+
+    def _resolve_topic_session(self, chat_id: str, target: str) -> tuple[TopicSession | None, str | None]:
+        cleaned = self._clean_topic_phrase(target)
+        if not cleaned:
+            return None, "I need a topic name or thread id."
+        if self._normalize_lookup(cleaned) in {"general", "generalchat", "all", "alltopic", "alltopics"}:
+            return None, "I cannot target General chat or all topics with a session lifecycle command."
+
+        sessions = self._sessions.list_topic_sessions(chat_id)
+        if not sessions:
+            return None, "I do not have any topic-backed sessions recorded for this chat."
+
+        thread_id = cleaned.removeprefix("#")
+        if thread_id.isdigit():
+            matches = [session for session in sessions if session.message_thread_id == int(thread_id)]
+            if len(matches) == 1:
+                return matches[0], None
+            return None, f"I could not find a recorded topic with thread id `{cleaned}`."
+
+        normalized_target = self._normalize_lookup(cleaned)
+        exact = [session for session in sessions if self._normalize_lookup(session.topic_name) == normalized_target]
+        if len(exact) == 1:
+            return exact[0], None
+        if len(exact) > 1:
+            return None, f"`{cleaned}` matches more than one topic. Use the thread id instead."
+
+        partial = [session for session in sessions if normalized_target in self._normalize_lookup(session.topic_name)]
+        if len(partial) == 1:
+            return partial[0], None
+        if len(partial) > 1:
+            names = ", ".join(f"`{session.topic_name}`" for session in partial[:5])
+            return None, f"`{cleaned}` is ambiguous. Matching topics: {names}."
+        return None, f"I could not find a recorded topic named `{cleaned}`."
+
+    def _handle_topic_lifecycle_request(
+        self,
+        message: IncomingMessage,
+        request: TopicLifecycleRequest,
+    ) -> bool:
+        session, error = self._resolve_topic_session(message.chat_id, request.target)
+        if session is None:
+            self._telegram.send_message(
+                message.chat_id,
+                error or "I could not find that topic session.",
+                reply_to_message_id=message.message_id,
+            )
+            return True
+
+        try:
+            if request.action == "rename":
+                new_name = self._clean_topic_phrase(request.new_name or "")
+                if not 1 <= len(new_name) <= 128:
+                    self._telegram.send_message(
+                        message.chat_id,
+                        "Topic names must be 1 to 128 characters.",
+                        reply_to_message_id=message.message_id,
+                    )
+                    return True
+                self._telegram.edit_forum_topic(
+                    message.chat_id,
+                    session.message_thread_id,
+                    name=new_name,
+                )
+                self._sessions.update_topic_session_name(session.session_key, new_name)
+                self._telegram.send_message(
+                    message.chat_id,
+                    f"Renamed topic `{session.topic_name}` to `{new_name}`.",
+                    reply_to_message_id=message.message_id,
+                )
+                return True
+
+            if request.action == "close":
+                self._telegram.close_forum_topic(message.chat_id, session.message_thread_id)
+                self._sessions.set_topic_session_closed(session.session_key, True)
+                self._telegram.send_message(
+                    message.chat_id,
+                    f"Closed topic `{session.topic_name}` and marked its session closed.",
+                    reply_to_message_id=message.message_id,
+                )
+                return True
+
+            if request.action == "reopen":
+                self._telegram.reopen_forum_topic(message.chat_id, session.message_thread_id)
+                self._sessions.set_topic_session_closed(session.session_key, False)
+                self._telegram.send_message(
+                    message.chat_id,
+                    f"Reopened topic `{session.topic_name}`.",
+                    reply_to_message_id=message.message_id,
+                )
+                return True
+
+            if request.action == "delete":
+                self._telegram.delete_forum_topic(message.chat_id, session.message_thread_id)
+                self._sessions.remove_topic_session(session.session_key)
+                self._telegram.send_message(
+                    message.chat_id,
+                    f"Deleted topic `{session.topic_name}` and removed only its bridge session state.",
+                    reply_to_message_id=message.message_id,
+                )
+                return True
+        except TelegramAPIError:
+            logger.warning(
+                "Failed Telegram topic lifecycle action=%s chat=%s thread=%s",
+                request.action,
+                message.chat_id,
+                session.message_thread_id,
+                exc_info=True,
+            )
+            self._telegram.send_message(
+                message.chat_id,
+                f"I could not {request.action} topic `{session.topic_name}`. "
+                "Check the bot's topic admin permissions and whether the topic still exists.",
+                reply_to_message_id=message.message_id,
+            )
+            return True
+
+        self._telegram.send_message(
+            message.chat_id,
+            "I did not recognize that topic lifecycle action.",
+            reply_to_message_id=message.message_id,
+        )
+        return True
+
     def _handle_general_forum_message(self, message: IncomingMessage) -> bool:
+        lifecycle_request = self._parse_topic_lifecycle_request(message.text)
+        if lifecycle_request is not None:
+            return self._handle_topic_lifecycle_request(message, lifecycle_request)
+
         request, error = self._parse_session_provisioning_request(message.text)
         if request is None:
             self._telegram.send_message(

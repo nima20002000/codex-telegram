@@ -18,6 +18,10 @@ class FakeTelegram:
         self.message_threads: list[int | None] = []
         self.reply_markups: list[dict | None] = []
         self.created_topics: list[tuple[str, str]] = []
+        self.edited_forum_topics: list[tuple[str, int, str]] = []
+        self.closed_forum_topics: list[tuple[str, int]] = []
+        self.reopened_forum_topics: list[tuple[str, int]] = []
+        self.deleted_forum_topics: list[tuple[str, int]] = []
         self.next_thread_id = 50
         self.edits: list[tuple[str, int, str, dict | None]] = []
         self.callback_answers: list[tuple[str, str | None]] = []
@@ -26,6 +30,7 @@ class FakeTelegram:
         self.calls: list[tuple[int | None, int]] = []
         self.fail_chat_action = False
         self.fail_create_forum_topic = False
+        self.fail_topic_lifecycle = False
 
     def send_message(self, chat_id, text, *, reply_to_message_id=None, message_thread_id=None, reply_markup=None):
         self.messages.append((chat_id, text, reply_to_message_id))
@@ -39,6 +44,26 @@ class FakeTelegram:
         topic = ForumTopic(message_thread_id=self.next_thread_id, name=name)
         self.next_thread_id += 1
         return topic
+
+    def edit_forum_topic(self, chat_id, message_thread_id, *, name):
+        if self.fail_topic_lifecycle:
+            raise TelegramAPIError("missing topic admin permission")
+        self.edited_forum_topics.append((chat_id, message_thread_id, name))
+
+    def close_forum_topic(self, chat_id, message_thread_id):
+        if self.fail_topic_lifecycle:
+            raise TelegramAPIError("missing topic admin permission")
+        self.closed_forum_topics.append((chat_id, message_thread_id))
+
+    def reopen_forum_topic(self, chat_id, message_thread_id):
+        if self.fail_topic_lifecycle:
+            raise TelegramAPIError("missing topic admin permission")
+        self.reopened_forum_topics.append((chat_id, message_thread_id))
+
+    def delete_forum_topic(self, chat_id, message_thread_id):
+        if self.fail_topic_lifecycle:
+            raise TelegramAPIError("missing topic admin permission")
+        self.deleted_forum_topics.append((chat_id, message_thread_id))
 
     def edit_message_text(self, chat_id, message_id, text, *, reply_markup=None):
         self.edits.append((chat_id, message_id, text, reply_markup))
@@ -502,6 +527,28 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(store.load("-1001"), [])
             self.assertIn("message_thread_id=7", codex.prompts[0])
 
+    def test_reset_command_in_forum_topic_resets_only_that_topic(self):
+        with TemporaryDirectory() as tmp:
+            telegram = FakeTelegram()
+            store = SessionStore(Path(tmp) / "state")
+            store.append("-1001:thread:7", "user", "topic seven")
+            store.append("-1001:thread:8", "user", "topic eight")
+            store.append("-1001", "user", "general")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(Path(tmp)),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("/reset", chat_id="-1001", message_thread_id=7))
+
+            self.assertEqual(store.load("-1001:thread:7"), [])
+            self.assertEqual([turn.text for turn in store.load("-1001:thread:8")], ["topic eight"])
+            self.assertEqual([turn.text for turn in store.load("-1001")], ["general"])
+            self.assertEqual(telegram.message_threads[-1], 7)
+
     def test_general_forum_message_creates_configured_topic_session(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -548,6 +595,223 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(telegram.message_threads[0], 50)
             self.assertIn("Created topic `kitia | gpt-5.5 high | yolo`", telegram.messages[1][1])
             self.assertEqual(telegram.message_threads[1], None)
+
+    def test_general_forum_message_renames_recorded_topic_session(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+            gateway.handle_message(
+                self._message(
+                    "make me a session in kitia folder with gpt 5.5 high in yolo mode",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "rename topic kitia to kitia renamed",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.edited_forum_topics, [("-1001", 50, "kitia renamed")])
+            topic_session = store.load_topic_session("-1001:thread:50")
+            self.assertIsNotNone(topic_session)
+            assert topic_session is not None
+            self.assertEqual(topic_session.topic_name, "kitia renamed")
+            self.assertIn("Renamed topic", telegram.messages[-1][1])
+
+    def test_general_forum_message_closes_and_reopens_topic_session(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+            gateway.handle_message(
+                self._message(
+                    "make me a session in kitia folder with gpt 5.5 high in yolo mode",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            gateway.handle_message(
+                self._message("close topic kitia", chat_id="-1001", chat_type="supergroup")
+            )
+            closed_session = store.load_topic_session("-1001:thread:50")
+            self.assertIsNotNone(closed_session)
+            assert closed_session is not None
+            self.assertTrue(closed_session.is_closed)
+
+            gateway.handle_message(
+                self._message("reopen topic kitia", chat_id="-1001", chat_type="supergroup")
+            )
+            reopened_session = store.load_topic_session("-1001:thread:50")
+            self.assertIsNotNone(reopened_session)
+            assert reopened_session is not None
+            self.assertFalse(reopened_session.is_closed)
+            self.assertEqual(telegram.closed_forum_topics, [("-1001", 50)])
+            self.assertEqual(telegram.reopened_forum_topics, [("-1001", 50)])
+
+    def test_general_forum_message_deletes_topic_and_cleans_bridge_state_only(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+            gateway.handle_message(
+                self._message(
+                    "make me a session in kitia folder with gpt 5.5 high in yolo mode",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+            store.append("-1001:thread:50", "user", "old topic state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=60,
+                session_key="-1001:thread:60",
+                topic_name="other topic",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+
+            gateway.handle_message(
+                self._message("delete topic kitia", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.deleted_forum_topics, [("-1001", 50)])
+            self.assertIsNone(store.load_topic_session("-1001:thread:50"))
+            self.assertEqual(store.load("-1001:thread:50"), [])
+            self.assertEqual(store.load_active_workspace("-1001:thread:50"), "")
+            self.assertIsNone(store.load_model_preference("-1001:thread:50"))
+            self.assertIsNone(store.load_sandbox_mode("-1001:thread:50"))
+            self.assertIsNotNone(store.load_topic_session("-1001:thread:60"))
+            self.assertTrue((root / "kitia").is_dir())
+            self.assertIn("removed only its bridge session state", telegram.messages[-1][1])
+
+    def test_general_forum_lifecycle_rejects_ambiguous_topic_target(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            for thread_id, name in ((50, "kitia dev"), (60, "kitia prod")):
+                store.save_topic_session(
+                    chat_id="-1001",
+                    message_thread_id=thread_id,
+                    session_key=f"-1001:thread:{thread_id}",
+                    topic_name=name,
+                    workspace="",
+                    model="gpt-5.5",
+                    reasoning_effort="high",
+                    sandbox_mode="constrained",
+                )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message("close topic kitia", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.closed_forum_topics, [])
+            self.assertIn("ambiguous", telegram.messages[-1][1])
+
+    def test_general_forum_lifecycle_rejects_all_topics_target(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=50,
+                session_key="-1001:thread:50",
+                topic_name="all topics archive",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message("delete topic all topics", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.deleted_forum_topics, [])
+            self.assertIsNotNone(store.load_topic_session("-1001:thread:50"))
+            self.assertIn("cannot target General chat or all topics", telegram.messages[-1][1])
+
+    def test_general_forum_lifecycle_reports_telegram_failure(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            telegram.fail_topic_lifecycle = True
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=50,
+                session_key="-1001:thread:50",
+                topic_name="kitia topic",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message("close topic kitia", chat_id="-1001", chat_type="supergroup")
+            )
+
+            session = store.load_topic_session("-1001:thread:50")
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertFalse(session.is_closed)
+            self.assertIn("could not close topic", telegram.messages[-1][1])
 
     def test_general_forum_message_rejects_unrecognized_session_request(self):
         with TemporaryDirectory() as tmp:

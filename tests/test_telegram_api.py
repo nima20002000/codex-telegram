@@ -113,6 +113,27 @@ class TelegramAPITests(unittest.TestCase):
             ],
         )
 
+    def test_topic_lifecycle_methods_send_expected_requests(self):
+        telegram = RecordingTelegramAPI()
+
+        telegram.edit_forum_topic("-1001", 50, name="renamed topic")
+        telegram.close_forum_topic("-1001", 50)
+        telegram.reopen_forum_topic("-1001", 50)
+        telegram.delete_forum_topic("-1001", 50)
+
+        self.assertEqual(
+            telegram.requests,
+            [
+                (
+                    "editForumTopic",
+                    {"chat_id": "-1001", "message_thread_id": 50, "name": "renamed topic"},
+                ),
+                ("closeForumTopic", {"chat_id": "-1001", "message_thread_id": 50}),
+                ("reopenForumTopic", {"chat_id": "-1001", "message_thread_id": 50}),
+                ("deleteForumTopic", {"chat_id": "-1001", "message_thread_id": 50}),
+            ],
+        )
+
     def test_split_send_message_keeps_forum_topic_on_all_chunks(self):
         telegram = RecordingTelegramAPI()
 

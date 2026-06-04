@@ -109,6 +109,41 @@ class SessionStoreTests(unittest.TestCase):
             self.assertEqual(session.model, "gpt-5.5")
             self.assertEqual(session.reasoning_effort, "high")
             self.assertEqual(session.sandbox_mode, "yolo")
+            self.assertFalse(session.is_closed)
+
+    def test_topic_session_lifecycle_updates_and_cleanup(self):
+        with TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            topic_key = "-1001:thread:50"
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=50,
+                session_key=topic_key,
+                topic_name="kitia | gpt-5.5 high | yolo",
+                workspace="kitia",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="yolo",
+            )
+            store.save_active_workspace(topic_key, "kitia")
+            store.save_model_preference(topic_key, model="gpt-5.5", reasoning_effort="high")
+            store.save_sandbox_mode(topic_key, "yolo")
+            store.append(topic_key, "user", "old context")
+
+            self.assertTrue(store.update_topic_session_name(topic_key, "renamed topic"))
+            self.assertTrue(store.set_topic_session_closed(topic_key, True))
+            sessions = store.list_topic_sessions("-1001")
+
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(sessions[0].topic_name, "renamed topic")
+            self.assertTrue(sessions[0].is_closed)
+
+            self.assertTrue(store.remove_topic_session(topic_key))
+            self.assertIsNone(store.load_topic_session(topic_key))
+            self.assertEqual(store.load_active_workspace(topic_key), "")
+            self.assertIsNone(store.load_model_preference(topic_key))
+            self.assertIsNone(store.load_sandbox_mode(topic_key))
+            self.assertEqual(store.load(topic_key), [])
 
 
 if __name__ == "__main__":
