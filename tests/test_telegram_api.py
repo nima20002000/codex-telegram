@@ -22,6 +22,7 @@ class TelegramAPITests(unittest.TestCase):
                 "update_id": 99,
                 "message": {
                     "message_id": 7,
+                    "message_thread_id": 3,
                     "text": "hello",
                     "chat": {"id": -100, "type": "private"},
                     "from": {"id": 42, "username": "nima"},
@@ -35,6 +36,7 @@ class TelegramAPITests(unittest.TestCase):
         self.assertEqual(message.chat_id, "-100")
         self.assertEqual(message.user_id, 42)
         self.assertEqual(message.text, "hello")
+        self.assertEqual(message.message_thread_id, 3)
 
     def test_parse_ignores_non_text_update(self):
         self.assertIsNone(parse_message_update({"update_id": 1, "message": {"chat": {"id": 1}}}))
@@ -49,6 +51,7 @@ class TelegramAPITests(unittest.TestCase):
                     "from": {"id": 42, "username": "nima"},
                     "message": {
                         "message_id": 8,
+                        "message_thread_id": 5,
                         "chat": {"id": 123, "type": "private"},
                     },
                 },
@@ -62,6 +65,57 @@ class TelegramAPITests(unittest.TestCase):
         self.assertEqual(callback.chat_id, "123")
         self.assertEqual(callback.user_id, 42)
         self.assertEqual(callback.data, "effort:gpt-5.5:xhigh")
+        self.assertEqual(callback.message_thread_id, 5)
+
+    def test_send_message_can_target_forum_topic(self):
+        telegram = RecordingTelegramAPI()
+
+        telegram.send_message("123", "hello", reply_to_message_id=8, message_thread_id=5)
+
+        self.assertEqual(
+            telegram.requests,
+            [
+                (
+                    "sendMessage",
+                    {
+                        "chat_id": "123",
+                        "text": "hello",
+                        "message_thread_id": 5,
+                        "reply_to_message_id": 8,
+                        "disable_web_page_preview": True,
+                        "reply_markup": None,
+                    },
+                )
+            ],
+        )
+
+    def test_split_send_message_keeps_forum_topic_on_all_chunks(self):
+        telegram = RecordingTelegramAPI()
+
+        telegram.send_message("123", "a" * 5000, message_thread_id=5)
+
+        chunks = [params for method, params in telegram.requests if method == "sendMessage"]
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(chunk["message_thread_id"] == 5 for chunk in chunks))
+
+    def test_send_chat_action_can_target_forum_topic(self):
+        telegram = RecordingTelegramAPI()
+
+        telegram.send_chat_action("123", message_thread_id=5)
+
+        self.assertEqual(
+            telegram.requests,
+            [
+                (
+                    "sendChatAction",
+                    {
+                        "chat_id": "123",
+                        "action": "typing",
+                        "message_thread_id": 5,
+                    },
+                )
+            ],
+        )
 
     def test_parse_ignores_edited_message_update(self):
         self.assertIsNone(

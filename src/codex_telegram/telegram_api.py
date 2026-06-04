@@ -21,6 +21,7 @@ class IncomingMessage:
     text: str
     message_id: int | None
     chat_type: str
+    message_thread_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,7 @@ class IncomingCallback:
     data: str
     message_id: int | None
     chat_type: str
+    message_thread_id: int | None = None
 
 
 def parse_message_update(update: dict[str, Any]) -> IncomingMessage | None:
@@ -57,6 +59,7 @@ def parse_message_update(update: dict[str, Any]) -> IncomingMessage | None:
         text=text.strip(),
         message_id=message.get("message_id"),
         chat_type=str(chat.get("type") or ""),
+        message_thread_id=message.get("message_thread_id") if isinstance(message.get("message_thread_id"), int) else None,
     )
 
 
@@ -90,6 +93,7 @@ def parse_callback_update(update: dict[str, Any]) -> IncomingCallback | None:
         data=data,
         message_id=message.get("message_id"),
         chat_type=str(chat.get("type") or ""),
+        message_thread_id=message.get("message_thread_id") if isinstance(message.get("message_thread_id"), int) else None,
     )
 
 
@@ -168,6 +172,7 @@ class TelegramAPI:
         text: str,
         *,
         reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
         reply_markup: dict[str, Any] | None = None,
     ) -> None:
         for chunk in split_telegram_text(text):
@@ -176,6 +181,7 @@ class TelegramAPI:
                 {
                     "chat_id": chat_id,
                     "text": chunk,
+                    "message_thread_id": message_thread_id,
                     "reply_to_message_id": reply_to_message_id,
                     "disable_web_page_preview": True,
                     "reply_markup": reply_markup,
@@ -206,5 +212,14 @@ class TelegramAPI:
     def answer_callback_query(self, callback_query_id: str, *, text: str | None = None) -> None:
         self._request("answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text})
 
-    def send_chat_action(self, chat_id: str, action: str = "typing") -> None:
-        self._request("sendChatAction", {"chat_id": chat_id, "action": action})
+    def send_chat_action(
+        self,
+        chat_id: str,
+        action: str = "typing",
+        *,
+        message_thread_id: int | None = None,
+    ) -> None:
+        self._request(
+            "sendChatAction",
+            {"chat_id": chat_id, "action": action, "message_thread_id": message_thread_id},
+        )

@@ -48,6 +48,12 @@ class CodexTelegramGateway:
         self._sessions = sessions
         self._offset: int | None = None
 
+    @staticmethod
+    def _session_key(incoming: IncomingMessage | IncomingCallback) -> str:
+        if incoming.message_thread_id is None:
+            return incoming.chat_id
+        return f"{incoming.chat_id}:thread:{incoming.message_thread_id}"
+
     def _workspace_path(self, relative_path: str) -> Path | None:
         root = self._settings.codex_workdir.resolve()
         candidate = root if relative_path in {"", "."} else (root / relative_path).resolve()
@@ -170,12 +176,19 @@ class CodexTelegramGateway:
         return True
 
     def _build_codex_prompt(self, message: IncomingMessage) -> str:
-        history = self._sessions.render_recent(message.chat_id)
+        session_key = self._session_key(message)
+        history = self._sessions.render_recent(session_key)
+        topic = (
+            f" message_thread_id={message.message_thread_id}"
+            if message.message_thread_id is not None
+            else ""
+        )
         identity = (
             f"Telegram user_id={message.user_id or 'unknown'} "
             f"username={message.username or 'unknown'} chat_id={message.chat_id} "
-            f"workspace={self._active_workdir(message.chat_id)} "
-            f"sandbox={self._sandbox_status_label(message.chat_id)}"
+            f"chat_type={message.chat_type}{topic} "
+            f"workspace={self._active_workdir(session_key)} "
+            f"sandbox={self._sandbox_status_label(session_key)}"
         )
         parts = [SYSTEM_PROMPT.strip(), identity]
         if history:
@@ -188,7 +201,7 @@ class CodexTelegramGateway:
         if command in {"/start", "/help"}:
             return "/reset\n/models\n/workspace\n/sandbox"
         if command == "/status":
-            status = self.status(message.chat_id)
+            status = self.status(self._session_key(message))
             return (
                 f"Workspace: {status.workdir}\n"
                 f"Allowed users configured: {status.allowed_users}\n"
@@ -198,7 +211,7 @@ class CodexTelegramGateway:
                 f"Sandbox: {status.sandbox}"
             )
         if command == "/reset":
-            self._sessions.reset(message.chat_id)
+            self._sessions.reset(self._session_key(message))
             return "This chat's bridge history was reset."
         return None
 
@@ -233,6 +246,7 @@ class CodexTelegramGateway:
             message.chat_id,
             "Choose a Codex model:",
             reply_to_message_id=message.message_id,
+            message_thread_id=message.message_thread_id,
             reply_markup=self._model_keyboard(),
         )
 
@@ -241,6 +255,7 @@ class CodexTelegramGateway:
             message.chat_id,
             "Choose sandbox mode:",
             reply_to_message_id=message.message_id,
+            message_thread_id=message.message_thread_id,
             reply_markup=self._sandbox_keyboard(),
         )
 
@@ -250,6 +265,7 @@ class CodexTelegramGateway:
             message.chat_id,
             self._workspace_text(path),
             reply_to_message_id=message.message_id,
+            message_thread_id=message.message_thread_id,
             reply_markup=self._workspace_keyboard(path),
         )
 
@@ -275,32 +291,35 @@ class CodexTelegramGateway:
                 message.chat_id,
                 command_response,
                 reply_to_message_id=message.message_id,
+                message_thread_id=message.message_thread_id,
             )
             return
 
         prompt = self._build_codex_prompt(message)
-        self._sessions.append(message.chat_id, "user", message.text)
+        session_key = self._session_key(message)
+        self._sessions.append(session_key, "user", message.text)
         try:
-            self._telegram.send_chat_action(message.chat_id)
+            self._telegram.send_chat_action(message.chat_id, message_thread_id=message.message_thread_id)
         except Exception:
             logger.warning("Failed to send Telegram typing indicator", exc_info=True)
-        preference = self._active_model_preference(message.chat_id)
+        preference = self._active_model_preference(session_key)
         result = self._codex.run(
             prompt,
             model=preference.model if preference else None,
             reasoning_effort=preference.reasoning_effort if preference else None,
-            workdir=self._active_workdir(message.chat_id),
-            sandbox_mode=self._active_sandbox_mode(message.chat_id),
+            workdir=self._active_workdir(session_key),
+            sandbox_mode=self._active_sandbox_mode(session_key),
         )
         response = result.text.strip()
         if len(response) > self._settings.max_telegram_response_chars:
             response = response[: self._settings.max_telegram_response_chars].rstrip()
             response += "\n\n[Response truncated by MAX_TELEGRAM_RESPONSE_CHARS.]"
-        self._sessions.append(message.chat_id, "assistant", response)
+        self._sessions.append(session_key, "assistant", response)
         self._telegram.send_message(
             message.chat_id,
             response,
             reply_to_message_id=message.message_id,
+            message_thread_id=message.message_thread_id,
         )
 
     def _reply_to_callback(
@@ -311,7 +330,12 @@ class CodexTelegramGateway:
         reply_markup: dict | None = None,
     ) -> None:
         if callback.message_id is None:
-            self._telegram.send_message(callback.chat_id, text, reply_markup=reply_markup)
+            self._telegram.send_message(
+                callback.chat_id,
+                text,
+                message_thread_id=callback.message_thread_id,
+                reply_markup=reply_markup,
+            )
             return
         self._telegram.edit_message_text(
             callback.chat_id,
@@ -326,6 +350,7 @@ class CodexTelegramGateway:
             self._telegram.answer_callback_query(callback.callback_query_id, text="Not authorized.")
             return
 
+        session_key = self._session_key(callback)
         if callback.data.startswith("model:"):
             slug = callback.data.split(":", 1)[1]
             model = self._model_catalog.get_model(slug)
@@ -362,10 +387,10 @@ class CodexTelegramGateway:
                 )
                 return
             if action == "s":
-                self._sessions.save_active_workspace(callback.chat_id, self._workspace_relative_path(path))
-                self._sessions.reset(callback.chat_id)
+                self._sessions.save_active_workspace(session_key, self._workspace_relative_path(path))
+                self._sessions.reset(session_key)
                 self._telegram.answer_callback_query(callback.callback_query_id, text="Session started.")
-                status = self.status(callback.chat_id)
+                status = self.status(session_key)
                 self._reply_to_callback(
                     callback,
                     f"Session workspace:\n{path}\n\n"
@@ -382,7 +407,7 @@ class CodexTelegramGateway:
             if mode not in {"constrained", "yolo"}:
                 self._telegram.answer_callback_query(callback.callback_query_id, text="Unknown sandbox mode.")
                 return
-            self._sessions.save_sandbox_mode(callback.chat_id, mode)
+            self._sessions.save_sandbox_mode(session_key, mode)
             self._telegram.answer_callback_query(callback.callback_query_id, text="Sandbox selected.")
             label = "YOLO" if mode == "yolo" else "Constrained"
             self._reply_to_callback(
@@ -402,7 +427,7 @@ class CodexTelegramGateway:
                 self._telegram.answer_callback_query(callback.callback_query_id, text="Selection is not available.")
                 self._reply_to_callback(callback, "That selection is no longer available. Send /models again.")
                 return
-            self._sessions.save_model_preference(callback.chat_id, model=model.slug, reasoning_effort=effort)
+            self._sessions.save_model_preference(session_key, model=model.slug, reasoning_effort=effort)
             self._telegram.answer_callback_query(callback.callback_query_id, text="Model selected.")
             self._reply_to_callback(
                 callback,
@@ -419,15 +444,16 @@ class CodexTelegramGateway:
             if callback is not None:
                 self.handle_callback(callback)
             return
-        if self._sessions.was_processed(message.chat_id, message.message_id, message.update_id):
+        processed_chat_key = self._session_key(message)
+        if self._sessions.was_processed(processed_chat_key, message.message_id, message.update_id):
             logger.info(
-                "Skipping already-processed Telegram message chat=%s message_id=%s update_id=%s",
-                message.chat_id,
+                "Skipping already-processed Telegram message session=%s message_id=%s update_id=%s",
+                processed_chat_key,
                 message.message_id,
                 message.update_id,
             )
             return
-        self._sessions.mark_processed(message.chat_id, message.message_id, message.update_id)
+        self._sessions.mark_processed(processed_chat_key, message.message_id, message.update_id)
         self.handle_message(message)
 
     def poll_once(self) -> None:

@@ -15,6 +15,7 @@ from codex_telegram.telegram_api import IncomingCallback, IncomingMessage
 class FakeTelegram:
     def __init__(self, updates=None):
         self.messages: list[tuple[str, str, int | None]] = []
+        self.message_threads: list[int | None] = []
         self.reply_markups: list[dict | None] = []
         self.edits: list[tuple[str, int, str, dict | None]] = []
         self.callback_answers: list[tuple[str, str | None]] = []
@@ -23,8 +24,9 @@ class FakeTelegram:
         self.calls: list[tuple[int | None, int]] = []
         self.fail_chat_action = False
 
-    def send_message(self, chat_id, text, *, reply_to_message_id=None, reply_markup=None):
+    def send_message(self, chat_id, text, *, reply_to_message_id=None, message_thread_id=None, reply_markup=None):
         self.messages.append((chat_id, text, reply_to_message_id))
+        self.message_threads.append(message_thread_id)
         self.reply_markups.append(reply_markup)
 
     def edit_message_text(self, chat_id, message_id, text, *, reply_markup=None):
@@ -33,10 +35,11 @@ class FakeTelegram:
     def answer_callback_query(self, callback_query_id, *, text=None):
         self.callback_answers.append((callback_query_id, text))
 
-    def send_chat_action(self, chat_id, action="typing"):
+    def send_chat_action(self, chat_id, action="typing", *, message_thread_id=None):
         if self.fail_chat_action:
             raise RuntimeError("typing failed")
-        self.actions.append(f"{chat_id}:{action}")
+        thread = f":thread:{message_thread_id}" if message_thread_id is not None else ""
+        self.actions.append(f"{chat_id}{thread}:{action}")
 
     def get_updates(self, *, offset, timeout):
         self.calls.append((offset, timeout))
@@ -106,27 +109,29 @@ class GatewayTests(unittest.TestCase):
             state_dir=workdir / ".state",
         )
 
-    def _message(self, text: str, *, user_id=42) -> IncomingMessage:
+    def _message(self, text: str, *, user_id=42, chat_id="100", message_thread_id=None) -> IncomingMessage:
         return IncomingMessage(
             update_id=1,
-            chat_id="100",
+            chat_id=chat_id,
             user_id=user_id,
             username="nima",
             text=text,
             message_id=9,
             chat_type="private",
+            message_thread_id=message_thread_id,
         )
 
-    def _callback(self, data: str, *, user_id=42) -> IncomingCallback:
+    def _callback(self, data: str, *, user_id=42, chat_id="100", message_thread_id=None) -> IncomingCallback:
         return IncomingCallback(
             update_id=2,
             callback_query_id="cb1",
-            chat_id="100",
+            chat_id=chat_id,
             user_id=user_id,
             username="nima",
             data=data,
             message_id=10,
             chat_type="private",
+            message_thread_id=message_thread_id,
         )
 
     def test_help_command_does_not_run_codex(self):
@@ -446,6 +451,53 @@ class GatewayTests(unittest.TestCase):
             self.assertIn("Current Telegram message", codex.prompts[0])
             self.assertNotIn("User: change the repo", codex.prompts[0])
             self.assertEqual([turn.role for turn in store.load("100")], ["user", "assistant"])
+
+    def test_forum_topic_message_replies_in_thread_and_uses_topic_session(self):
+        with TemporaryDirectory() as tmp:
+            telegram = FakeTelegram()
+            codex = FakeCodex("finished")
+            store = SessionStore(Path(tmp) / "state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(Path(tmp)),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("topic task", chat_id="-1001", message_thread_id=7))
+
+            self.assertEqual(telegram.actions, ["-1001:thread:7:typing"])
+            self.assertEqual(telegram.messages[-1][0], "-1001")
+            self.assertEqual(telegram.messages[-1][1], "finished")
+            self.assertEqual(telegram.message_threads[-1], 7)
+            self.assertEqual([turn.role for turn in store.load("-1001:thread:7")], ["user", "assistant"])
+            self.assertEqual(store.load("-1001"), [])
+            self.assertIn("message_thread_id=7", codex.prompts[0])
+
+    def test_forum_topic_model_preference_is_separate_from_group_default(self):
+        with TemporaryDirectory() as tmp:
+            telegram = FakeTelegram()
+            codex = FakeCodex("finished")
+            store = SessionStore(Path(tmp) / "state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(Path(tmp)),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_callback(
+                self._callback("effort:gpt-5.5:xhigh", chat_id="-1001", message_thread_id=7)
+            )
+            gateway.handle_message(self._message("topic task", chat_id="-1001", message_thread_id=7))
+            gateway.handle_message(self._message("general task", chat_id="-1001"))
+
+            self.assertEqual(store.load_model_preference("-1001:thread:7").model, "gpt-5.5")
+            self.assertIsNone(store.load_model_preference("-1001"))
+            self.assertEqual(codex.runs[-2][0:2], ("gpt-5.5", "xhigh"))
+            self.assertEqual(codex.runs[-1][0:2], (None, None))
 
     def test_typing_indicator_failure_does_not_drop_request(self):
         with TemporaryDirectory() as tmp:
