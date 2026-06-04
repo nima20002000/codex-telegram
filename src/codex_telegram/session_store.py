@@ -33,6 +33,8 @@ class TopicSession:
     reasoning_effort: str
     sandbox_mode: str
     is_closed: bool
+    compact_metadata: dict[str, object]
+    goal_metadata: dict[str, object]
 
 
 def _safe_chat_key(chat_id: str) -> str:
@@ -264,6 +266,8 @@ class SessionStore:
             "reasoning_effort": reasoning_effort,
             "sandbox_mode": sandbox_mode,
             "is_closed": False,
+            "compact_metadata": {},
+            "goal_metadata": {},
         }
         self._save_topic_sessions(sessions)
 
@@ -279,6 +283,8 @@ class SessionStore:
         reasoning_effort = raw.get("reasoning_effort")
         sandbox_mode = raw.get("sandbox_mode")
         is_closed = raw.get("is_closed", False)
+        compact_metadata = raw.get("compact_metadata", {})
+        goal_metadata = raw.get("goal_metadata", {})
         if not (
             isinstance(chat_id, str)
             and isinstance(message_thread_id, int)
@@ -288,6 +294,8 @@ class SessionStore:
             and isinstance(reasoning_effort, str)
             and isinstance(sandbox_mode, str)
             and isinstance(is_closed, bool)
+            and isinstance(compact_metadata, dict)
+            and isinstance(goal_metadata, dict)
         ):
             return None
         return TopicSession(
@@ -300,6 +308,8 @@ class SessionStore:
             reasoning_effort=reasoning_effort,
             sandbox_mode=sandbox_mode,
             is_closed=is_closed,
+            compact_metadata=compact_metadata,
+            goal_metadata=goal_metadata,
         )
 
     def list_topic_sessions(self, chat_id: str | None = None) -> list[TopicSession]:

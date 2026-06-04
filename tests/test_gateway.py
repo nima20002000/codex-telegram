@@ -932,6 +932,72 @@ class GatewayTests(unittest.TestCase):
             self.assertIn(f"workspace={kitia.resolve()}", codex.prompts[-1])
             self.assertEqual(telegram.message_threads[-1], 50)
 
+    def test_two_created_topics_keep_independent_runtime_state(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kitia = root / "kitia"
+            kitia.mkdir()
+            salona = root / "salona"
+            salona.mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex("finished")
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make me a session in kitia folder with gpt 5.5 high in yolo mode",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+            gateway.handle_message(
+                self._message(
+                    "make me an agent in salona folder with gpt 5.4 mini low in constrained mode",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+            gateway.handle_message(
+                self._message(
+                    "kitia task",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                    message_thread_id=50,
+                )
+            )
+            gateway.handle_message(
+                self._message(
+                    "salona task",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                    message_thread_id=51,
+                )
+            )
+
+            self.assertEqual(
+                telegram.created_topics,
+                [
+                    ("-1001", "kitia | gpt-5.5 high | yolo"),
+                    ("-1001", "salona | gpt-5.4-mini low | constrained"),
+                ],
+            )
+            self.assertEqual(codex.runs[-2], ("gpt-5.5", "high", kitia.resolve(), "yolo"))
+            self.assertEqual(codex.runs[-1], ("gpt-5.4-mini", "low", salona.resolve(), "constrained"))
+            self.assertIn("Current Telegram message:\nkitia task", codex.prompts[-2])
+            self.assertNotIn("salona task", codex.prompts[-2])
+            self.assertIn("Current Telegram message:\nsalona task", codex.prompts[-1])
+            self.assertNotIn("kitia task", codex.prompts[-1])
+            self.assertEqual([turn.text for turn in store.load("-1001:thread:50")], ["kitia task", "finished"])
+            self.assertEqual([turn.text for turn in store.load("-1001:thread:51")], ["salona task", "finished"])
+            self.assertEqual(store.load("-1001"), [])
+
     def test_forum_topic_model_preference_is_separate_from_group_default(self):
         with TemporaryDirectory() as tmp:
             telegram = FakeTelegram()
@@ -955,6 +1021,41 @@ class GatewayTests(unittest.TestCase):
             self.assertIsNone(store.load_model_preference("-1001"))
             self.assertEqual(codex.runs[-2][0:2], ("gpt-5.5", "xhigh"))
             self.assertEqual(codex.runs[-1][0:2], (None, None))
+
+    def test_callbacks_in_two_topics_keep_preferences_separate(self):
+        with TemporaryDirectory() as tmp:
+            telegram = FakeTelegram()
+            codex = FakeCodex("finished")
+            store = SessionStore(Path(tmp) / "state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(Path(tmp)),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_callback(
+                self._callback("effort:gpt-5.5:xhigh", chat_id="-1001", message_thread_id=7)
+            )
+            gateway.handle_callback(
+                self._callback("effort:gpt-5.4-mini:low", chat_id="-1001", message_thread_id=8)
+            )
+            gateway.handle_callback(
+                self._callback("sandbox:yolo", chat_id="-1001", message_thread_id=7)
+            )
+            gateway.handle_callback(
+                self._callback("sandbox:constrained", chat_id="-1001", message_thread_id=8)
+            )
+            gateway.handle_message(self._message("topic seven", chat_id="-1001", message_thread_id=7))
+            gateway.handle_message(self._message("topic eight", chat_id="-1001", message_thread_id=8))
+
+            self.assertEqual(codex.runs[-2][0:2], ("gpt-5.5", "xhigh"))
+            self.assertEqual(codex.runs[-2][3], "yolo")
+            self.assertEqual(codex.runs[-1][0:2], ("gpt-5.4-mini", "low"))
+            self.assertEqual(codex.runs[-1][3], "constrained")
+            self.assertIsNone(store.load_model_preference("-1001"))
+            self.assertIsNone(store.load_sandbox_mode("-1001"))
 
     def test_typing_indicator_failure_does_not_drop_request(self):
         with TemporaryDirectory() as tmp:
@@ -1012,6 +1113,40 @@ class GatewayTests(unittest.TestCase):
             )
 
             self.assertEqual(len(codex.prompts), 2)
+
+    def test_same_message_id_in_different_topics_is_not_treated_as_duplicate(self):
+        with TemporaryDirectory() as tmp:
+            telegram = FakeTelegram()
+            codex = FakeCodex("finished")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(Path(tmp)),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(Path(tmp) / "state"),
+            )
+
+            def update(update_id: int, thread_id: int, text: str) -> dict:
+                return {
+                    "update_id": update_id,
+                    "message": {
+                        "message_id": 9,
+                        "message_thread_id": thread_id,
+                        "text": text,
+                        "chat": {"id": -1001, "type": "supergroup"},
+                        "from": {"id": 42, "username": "nima"},
+                    },
+                }
+
+            gateway.handle_update(update(10, 7, "topic seven first"))
+            gateway.handle_update(update(11, 8, "topic eight first"))
+            gateway.handle_update(update(12, 7, "topic seven duplicate"))
+
+            self.assertEqual(len(codex.prompts), 2)
+            self.assertIn("topic seven first", codex.prompts[0])
+            self.assertIn("topic eight first", codex.prompts[1])
+            self.assertNotIn("topic seven duplicate", "\n".join(codex.prompts))
+            self.assertEqual(telegram.message_threads[-2:], [7, 8])
 
     def test_unauthorized_message_is_ignored(self):
         with TemporaryDirectory() as tmp:

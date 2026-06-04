@@ -31,6 +31,16 @@ class SessionStoreTests(unittest.TestCase):
             self.assertTrue(store.was_processed("chat", 10, 1))
             self.assertFalse(store.was_processed("chat", 11, 2))
 
+    def test_processed_message_ledger_is_scoped_by_topic_session_key(self):
+        with TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+
+            store.mark_processed("-1001:thread:7", 10, 1)
+
+            self.assertTrue(store.was_processed("-1001:thread:7", 10, 1))
+            self.assertFalse(store.was_processed("-1001:thread:8", 10, 2))
+            self.assertFalse(store.was_processed("-1001", 10, 3))
+
     def test_model_preference_round_trip(self):
         with TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp))
@@ -110,6 +120,8 @@ class SessionStoreTests(unittest.TestCase):
             self.assertEqual(session.reasoning_effort, "high")
             self.assertEqual(session.sandbox_mode, "yolo")
             self.assertFalse(session.is_closed)
+            self.assertEqual(session.compact_metadata, {})
+            self.assertEqual(session.goal_metadata, {})
 
     def test_topic_session_lifecycle_updates_and_cleanup(self):
         with TemporaryDirectory() as tmp:
