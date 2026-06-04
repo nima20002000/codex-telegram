@@ -57,6 +57,27 @@ session to send a harmless marker message in the group and poll for the bot's
 reply. Keep messages explicitly non-mutating, for example: ask the bot to reply
 with a unique marker and not modify files.
 
+Use the committed preflight harness when possible instead of rewriting one-off
+Telethon scripts:
+
+```bash
+/tmp/codex-telegram-e2e-venv/bin/python scripts/telegram-e2e-preflight.py \
+  --env-file $HOME/.local/share/codex-telegram/.env \
+  --credentials telegram-cred.md \
+  --session .codex-telegram/e2e/admin-account \
+  --group "Codex Telegram E2E" \
+  --expected-service-workdir $HOME/.local/share/codex-telegram \
+  --expected-service-branch feature/add-feature \
+  --marker
+```
+
+The harness uses Bot API `getMe` only; it never calls `getUpdates`. It redacts
+tokens, API hashes, user IDs, and private chat IDs from output. For release
+checks, also pass `--expected-service-commit <short-sha>` when the service must
+be proven to run a specific checkout. If the service is intentionally stopped
+because a foreground bridge is running from this checkout, pass
+`--skip-service-check` and record that choice in the Linear evidence.
+
 ## Commit & Pull Request Guidelines
 
 Recent commits use short imperative subjects, for example `Add Telegram model picker` and `Fix stale Codex model preferences`. Keep commits scoped to one behavior change and include tests or a clear reason tests were not run. Pull requests should describe the runtime impact, list validation commands, and mention any configuration or systemd changes. Include screenshots only for Telegram UI-visible command or button changes.

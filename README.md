@@ -90,6 +90,26 @@ From the allowed Telegram user, send `/status`, `/models`, `/workspace`, and
 `/sandbox`. Replies should arrive and logs should not show authorization or
 runtime errors.
 
+For the private forum-group manual E2E path, use the optional Telethon preflight
+harness from this checkout. It reuses the ignored admin session and credential
+note, checks the live service checkout, verifies bot admin rights, and can send
+a harmless `/status` marker without calling Bot API `getUpdates`:
+
+```bash
+/tmp/codex-telegram-e2e-venv/bin/python scripts/telegram-e2e-preflight.py \
+  --env-file $HOME/.local/share/codex-telegram/.env \
+  --credentials telegram-cred.md \
+  --session .codex-telegram/e2e/admin-account \
+  --group "Codex Telegram E2E" \
+  --expected-service-workdir $HOME/.local/share/codex-telegram \
+  --expected-service-branch feature/add-feature \
+  --marker
+```
+
+The harness redacts tokens, Telegram API hashes, user IDs, and private chat IDs
+from its output. Pass `--expected-service-commit <short-sha>` when a release or
+deployment check must prove the service is running a specific commit.
+
 ## Commands
 
 - `/reset`
