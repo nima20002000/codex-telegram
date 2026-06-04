@@ -22,6 +22,14 @@ from .telegram_api import (
 logger = logging.getLogger(__name__)
 
 AUTO_COMPACT_HISTORY_CHARS = 24000
+REASONING_EFFORT_RANK = {
+    "minimal": 0,
+    "none": 0,
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+    "xhigh": 4,
+}
 
 
 SYSTEM_PROMPT = """You are Codex, reached through a Telegram bot bridge.
@@ -39,6 +47,7 @@ class GatewayStatus:
     model: str
     reasoning_effort: str
     sandbox: str
+    fast_mode: str
 
 
 @dataclass(frozen=True)
@@ -360,7 +369,8 @@ class CodexTelegramGateway:
             lines.append(
                 f"- {session.topic_name} [{status}] "
                 f"workspace={workspace} model={session.model} "
-                f"thinking={session.reasoning_effort} sandbox={session.sandbox_mode}"
+                f"thinking={session.reasoning_effort} sandbox={session.sandbox_mode} "
+                f"fast={'on' if session.fast_mode else 'off'}"
             )
         self._telegram.send_message(
             message.chat_id,
@@ -615,8 +625,32 @@ class CodexTelegramGateway:
         self._sessions.clear_model_preference(chat_id)
         return None
 
-    def status(self, chat_id: str | None = None) -> GatewayStatus:
+    def _fast_reasoning_effort(self, model_slug: str | None) -> str:
+        if model_slug:
+            model = self._model_catalog.get_model(model_slug)
+            if model is not None:
+                ranked_efforts = [
+                    effort for effort in model.reasoning_efforts if effort in REASONING_EFFORT_RANK
+                ]
+                if ranked_efforts:
+                    return min(ranked_efforts, key=lambda effort: REASONING_EFFORT_RANK[effort])
+                if model.reasoning_efforts:
+                    return model.reasoning_efforts[0]
+        return "low"
+
+    def _effective_model_preference(self, chat_id: str | None) -> ChatModelPreference | None:
         preference = self._active_model_preference(chat_id)
+        if chat_id is None or not self._sessions.load_fast_mode(chat_id):
+            return preference
+        model = preference.model if preference is not None else self._settings.codex_model
+        return ChatModelPreference(
+            model=model,
+            reasoning_effort=self._fast_reasoning_effort(model or None),
+        )
+
+    def status(self, chat_id: str | None = None) -> GatewayStatus:
+        preference = self._effective_model_preference(chat_id)
+        fast_mode = self._sessions.load_fast_mode(chat_id) if chat_id is not None else False
         return GatewayStatus(
             workdir=str(self._active_workdir(chat_id)),
             allowed_users=len(self._settings.allowed_users),
@@ -629,6 +663,7 @@ class CodexTelegramGateway:
                 or "config/default"
             ),
             sandbox=self._sandbox_status_label(chat_id),
+            fast_mode="on" if fast_mode else "off",
         )
 
     def _is_authorized(self, incoming: IncomingMessage | IncomingCallback) -> bool:
@@ -672,7 +707,7 @@ class CodexTelegramGateway:
     def _command_response(self, message: IncomingMessage) -> str | None:
         command = message.text.split(maxsplit=1)[0].split("@", 1)[0].lower()
         if command in {"/start", "/help"}:
-            return "/reset\n/compact\n/models\n/workspace\n/sandbox"
+            return "/reset\n/compact\n/fast\n/models\n/workspace\n/sandbox"
         if command == "/status":
             status = self.status(self._session_key(message))
             return (
@@ -681,7 +716,8 @@ class CodexTelegramGateway:
                 f"Allowed chats configured: {status.allowed_chats}\n"
                 f"Model: {status.model}\n"
                 f"Thinking: {status.reasoning_effort}\n"
-                f"Sandbox: {status.sandbox}"
+                f"Sandbox: {status.sandbox}\n"
+                f"Fast mode: {status.fast_mode}"
             )
         if command == "/reset":
             session_key = self._session_key(message)
@@ -735,7 +771,7 @@ class CodexTelegramGateway:
             reply_to_message_id=reply_to_message_id,
             message_thread_id=message.message_thread_id,
         )
-        preference = self._active_model_preference(session_key)
+        preference = self._effective_model_preference(session_key)
         self._active_session_keys.add(session_key)
         try:
             result = self._codex.compact(
@@ -784,6 +820,59 @@ class CodexTelegramGateway:
             )
             return
         self._compact_session(message, auto=False, reply_to_message_id=message.message_id)
+
+    def _handle_fast_command(self, message: IncomingMessage) -> None:
+        if message.message_thread_id is None:
+            self._telegram.send_message(
+                message.chat_id,
+                "Run /fast inside a Codex session topic, or use `/fast status` there to inspect that topic.",
+                reply_to_message_id=message.message_id,
+            )
+            return
+        session_key = self._session_key(message)
+        if self._sessions.load_topic_session(session_key) is None:
+            self._telegram.send_message(
+                message.chat_id,
+                "Run /fast inside a recorded Codex session topic.",
+                reply_to_message_id=message.message_id,
+                message_thread_id=message.message_thread_id,
+            )
+            return
+
+        parts = message.text.split(maxsplit=1)
+        action = parts[1].strip().lower() if len(parts) > 1 else "on"
+        if action in {"status", "state"}:
+            self._telegram.send_message(
+                message.chat_id,
+                f"Fast mode: {'on' if self._sessions.load_fast_mode(session_key) else 'off'}",
+                reply_to_message_id=message.message_id,
+                message_thread_id=message.message_thread_id,
+            )
+            return
+        if action in {"on", "enable", "enabled"}:
+            self._sessions.set_fast_mode(session_key, True)
+            self._telegram.send_message(
+                message.chat_id,
+                "Fast mode enabled for this topic. Model and sandbox stay unchanged; reasoning uses the lowest supported effort.",
+                reply_to_message_id=message.message_id,
+                message_thread_id=message.message_thread_id,
+            )
+            return
+        if action in {"off", "disable", "disabled"}:
+            self._sessions.set_fast_mode(session_key, False)
+            self._telegram.send_message(
+                message.chat_id,
+                "Fast mode disabled for this topic.",
+                reply_to_message_id=message.message_id,
+                message_thread_id=message.message_thread_id,
+            )
+            return
+        self._telegram.send_message(
+            message.chat_id,
+            "Use `/fast`, `/fast off`, or `/fast status`.",
+            reply_to_message_id=message.message_id,
+            message_thread_id=message.message_thread_id,
+        )
 
     def _maybe_auto_compact(self, message: IncomingMessage, session_key: str) -> None:
         if message.message_thread_id is None:
@@ -864,6 +953,9 @@ class CodexTelegramGateway:
         if command == "/compact":
             self._handle_compact_command(message)
             return
+        if command == "/fast":
+            self._handle_fast_command(message)
+            return
 
         command_response = self._command_response(message)
         if command_response is not None:
@@ -895,12 +987,12 @@ class CodexTelegramGateway:
             self._telegram.send_chat_action(message.chat_id, message_thread_id=message.message_thread_id)
         except Exception:
             logger.warning("Failed to send Telegram typing indicator", exc_info=True)
-        preference = self._active_model_preference(session_key)
+        preference = self._effective_model_preference(session_key)
         self._active_session_keys.add(session_key)
         try:
             result = self._codex.run(
                 prompt,
-                model=preference.model if preference else None,
+                model=preference.model if preference and preference.model else None,
                 reasoning_effort=preference.reasoning_effort if preference else None,
                 workdir=self._active_workdir(session_key),
                 sandbox_mode=self._active_sandbox_mode(session_key),
@@ -994,7 +1086,8 @@ class CodexTelegramGateway:
                     f"Session workspace:\n{path}\n\n"
                     f"Model: {status.model}\n"
                     f"Thinking: {status.reasoning_effort}\n"
-                    f"Sandbox: {status.sandbox}",
+                    f"Sandbox: {status.sandbox}\n"
+                    f"Fast mode: {status.fast_mode}",
                 )
                 return
             self._telegram.answer_callback_query(callback.callback_query_id, text="Unknown action.")
@@ -1026,6 +1119,7 @@ class CodexTelegramGateway:
                 self._reply_to_callback(callback, "That selection is no longer available. Send /models again.")
                 return
             self._sessions.save_model_preference(session_key, model=model.slug, reasoning_effort=effort)
+            self._sessions.set_fast_mode(session_key, False)
             self._telegram.answer_callback_query(callback.callback_query_id, text="Model selected.")
             self._reply_to_callback(
                 callback,

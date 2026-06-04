@@ -120,6 +120,7 @@ class SessionStoreTests(unittest.TestCase):
             self.assertEqual(session.reasoning_effort, "high")
             self.assertEqual(session.sandbox_mode, "yolo")
             self.assertFalse(session.is_closed)
+            self.assertFalse(session.fast_mode)
             self.assertEqual(session.compact_metadata, {})
             self.assertEqual(session.goal_metadata, {})
 
@@ -156,6 +157,38 @@ class SessionStoreTests(unittest.TestCase):
             self.assertIsNone(store.load_model_preference(topic_key))
             self.assertIsNone(store.load_sandbox_mode(topic_key))
             self.assertEqual(store.load(topic_key), [])
+
+    def test_topic_fast_mode_round_trip(self):
+        with TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            topic_key = "-1001:thread:50"
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=50,
+                session_key=topic_key,
+                topic_name="kitia | gpt-5.5 high | yolo",
+                workspace="kitia",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="yolo",
+            )
+
+            self.assertFalse(store.load_fast_mode(topic_key))
+            self.assertTrue(store.set_fast_mode(topic_key, True))
+            self.assertTrue(store.load_fast_mode(topic_key))
+            session = store.load_topic_session(topic_key)
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertTrue(session.fast_mode)
+            self.assertTrue(store.set_fast_mode(topic_key, False))
+            self.assertFalse(store.load_fast_mode(topic_key))
+
+    def test_topic_fast_mode_requires_existing_topic_session(self):
+        with TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+
+            self.assertFalse(store.set_fast_mode("missing", True))
+            self.assertFalse(store.load_fast_mode("missing"))
 
     def test_topic_compact_metadata_round_trip_and_clear(self):
         with TemporaryDirectory() as tmp:

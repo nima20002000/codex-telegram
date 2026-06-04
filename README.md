@@ -114,6 +114,7 @@ deployment check must prove the service is running a specific commit.
 
 - `/reset`
 - `/compact`
+- `/fast`
 - `/models`
 - `/workspace`
 - `/sandbox`
@@ -124,6 +125,10 @@ Any other text message is sent to `codex exec`.
 Telegram conversation context, stores the compact summary locally, clears the
 raw recent history for that topic, and keeps later messages in that topic using
 the compacted context. General chat `/compact` does not compact topic sessions.
+
+`/fast` is also topic-scoped. It keeps the current model and sandbox, but runs
+that topic with the lowest supported reasoning effort until `/fast off` is sent
+or an explicit model/thinking selection is made.
 
 `/workspace` opens an inline folder browser rooted at `CODEX_WORKDIR`. Use folder
 buttons to move into child directories, then press `Start session` to make later

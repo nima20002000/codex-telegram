@@ -224,6 +224,7 @@ class TelegramAPITests(unittest.TestCase):
             [
                 ("/reset", "Reset"),
                 ("/compact", "Compact context"),
+                ("/fast", "Fast mode"),
                 ("/models", "Models"),
                 ("/workspace", "Workspace"),
                 ("/sandbox", "Sandbox"),
@@ -239,6 +240,7 @@ class TelegramAPITests(unittest.TestCase):
                         "commands": [
                             {"command": "reset", "description": "Reset"},
                             {"command": "compact", "description": "Compact context"},
+                            {"command": "fast", "description": "Fast mode"},
                             {"command": "models", "description": "Models"},
                             {"command": "workspace", "description": "Workspace"},
                             {"command": "sandbox", "description": "Sandbox"},

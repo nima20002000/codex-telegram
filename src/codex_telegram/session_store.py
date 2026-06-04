@@ -34,6 +34,7 @@ class TopicSession:
     reasoning_effort: str
     sandbox_mode: str
     is_closed: bool
+    fast_mode: bool
     compact_metadata: dict[str, object]
     goal_metadata: dict[str, object]
 
@@ -270,6 +271,7 @@ class SessionStore:
             "reasoning_effort": reasoning_effort,
             "sandbox_mode": sandbox_mode,
             "is_closed": False,
+            "fast_mode": False,
             "compact_metadata": {},
             "goal_metadata": {},
         }
@@ -287,6 +289,7 @@ class SessionStore:
         reasoning_effort = raw.get("reasoning_effort")
         sandbox_mode = raw.get("sandbox_mode")
         is_closed = raw.get("is_closed", False)
+        fast_mode = raw.get("fast_mode", False)
         compact_metadata = raw.get("compact_metadata", {})
         goal_metadata = raw.get("goal_metadata", {})
         if not (
@@ -298,6 +301,7 @@ class SessionStore:
             and isinstance(reasoning_effort, str)
             and isinstance(sandbox_mode, str)
             and isinstance(is_closed, bool)
+            and isinstance(fast_mode, bool)
             and isinstance(compact_metadata, dict)
             and isinstance(goal_metadata, dict)
         ):
@@ -312,6 +316,7 @@ class SessionStore:
             reasoning_effort=reasoning_effort,
             sandbox_mode=sandbox_mode,
             is_closed=is_closed,
+            fast_mode=fast_mode,
             compact_metadata=compact_metadata,
             goal_metadata=goal_metadata,
         )
@@ -344,6 +349,19 @@ class SessionStore:
         session["is_closed"] = is_closed
         self._save_topic_sessions(sessions)
         return True
+
+    def set_fast_mode(self, session_key: str, enabled: bool) -> bool:
+        sessions = self._load_topic_sessions()
+        session = sessions.get(session_key)
+        if not isinstance(session, dict):
+            return False
+        session["fast_mode"] = enabled
+        self._save_topic_sessions(sessions)
+        return True
+
+    def load_fast_mode(self, session_key: str) -> bool:
+        session = self.load_topic_session(session_key)
+        return bool(session.fast_mode) if session is not None else False
 
     def save_compact_metadata(
         self,

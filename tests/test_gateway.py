@@ -158,6 +158,13 @@ class PrefixModelCatalog(FakeModelCatalog):
         )
 
 
+class NoLowModelCatalog(FakeModelCatalog):
+    def __init__(self):
+        self.models = (
+            ModelChoice("gpt-special", "GPT Special", ("high", "medium"), "medium"),
+        )
+
+
 class GatewayTests(unittest.TestCase):
     def _settings(
         self,
@@ -232,7 +239,7 @@ class GatewayTests(unittest.TestCase):
             gateway.handle_message(self._message("/help"))
 
             self.assertEqual(len(codex.prompts), 0)
-            self.assertEqual(telegram.messages[0][1], "/reset\n/compact\n/models\n/workspace\n/sandbox")
+            self.assertEqual(telegram.messages[0][1], "/reset\n/compact\n/fast\n/models\n/workspace\n/sandbox")
 
     def test_status_command_shows_status(self):
         with TemporaryDirectory() as tmp:
@@ -252,6 +259,7 @@ class GatewayTests(unittest.TestCase):
             self.assertIn(f"Workspace: {Path(tmp).resolve()}", telegram.messages[0][1])
             self.assertIn("Model: default", telegram.messages[0][1])
             self.assertIn("Sandbox: configured (workspace-write)", telegram.messages[0][1])
+            self.assertIn("Fast mode: off", telegram.messages[0][1])
 
     def test_workspace_command_shows_folder_buttons(self):
         with TemporaryDirectory() as tmp:
@@ -375,6 +383,7 @@ class GatewayTests(unittest.TestCase):
             self.assertIn(f"Session workspace:\n{avatar.resolve()}", telegram.edits[1][2])
             self.assertIn("Model: gpt-5.5", telegram.edits[1][2])
             self.assertIn("Sandbox: configured (workspace-write)", telegram.edits[1][2])
+            self.assertIn("Fast mode: off", telegram.edits[1][2])
             self.assertEqual(codex.runs[-1], ("gpt-5.5", "xhigh", avatar.resolve(), None))
             self.assertNotIn("old context", codex.prompts[-1])
 
@@ -874,6 +883,264 @@ class GatewayTests(unittest.TestCase):
             self.assertTrue(topic_session.compact_metadata["auto"])
             self.assertEqual([turn.text for turn in store.load(topic_key)], ["continue after compaction", "after compact"])
             self.assertIn("compacted summary", codex.prompts[-1])
+
+    def test_fast_command_in_topic_lowers_reasoning_without_changing_model_or_sandbox(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            topic_key = "-1001:thread:7"
+            telegram = FakeTelegram()
+            codex = FakeCodex("fast response")
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key=topic_key,
+                topic_name="kitia topic",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="yolo",
+            )
+            store.save_model_preference(topic_key, model="gpt-5.5", reasoning_effort="high")
+            store.save_sandbox_mode(topic_key, "yolo")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("/fast", chat_id="-1001", message_thread_id=7))
+            gateway.handle_message(self._message("do it quickly", chat_id="-1001", message_thread_id=7))
+
+            self.assertTrue(store.load_fast_mode(topic_key))
+            self.assertIn("Fast mode enabled", telegram.messages[-2][1])
+            self.assertEqual(codex.runs[-1], ("gpt-5.5", "low", root.resolve(), "yolo"))
+            preference = store.load_model_preference(topic_key)
+            self.assertIsNotNone(preference)
+            assert preference is not None
+            self.assertEqual(preference.reasoning_effort, "high")
+
+    def test_fast_command_is_topic_scoped_and_status_reports_mode(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            for thread_id in (7, 8):
+                store.save_topic_session(
+                    chat_id="-1001",
+                    message_thread_id=thread_id,
+                    session_key=f"-1001:thread:{thread_id}",
+                    topic_name=f"topic {thread_id}",
+                    workspace="",
+                    model="gpt-5.5",
+                    reasoning_effort="high",
+                    sandbox_mode="constrained",
+                )
+                store.save_model_preference(f"-1001:thread:{thread_id}", model="gpt-5.5", reasoning_effort="high")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("/fast", chat_id="-1001", message_thread_id=7))
+            gateway.handle_message(self._message("/status", chat_id="-1001", message_thread_id=7))
+            gateway.handle_message(self._message("/status", chat_id="-1001", message_thread_id=8))
+
+            self.assertTrue(store.load_fast_mode("-1001:thread:7"))
+            self.assertFalse(store.load_fast_mode("-1001:thread:8"))
+            self.assertIn("Thinking: low", telegram.messages[-2][1])
+            self.assertIn("Fast mode: on", telegram.messages[-2][1])
+            self.assertIn("Thinking: high", telegram.messages[-1][1])
+            self.assertIn("Fast mode: off", telegram.messages[-1][1])
+
+    def test_fast_command_in_general_chat_does_not_affect_topics(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key="-1001:thread:7",
+                topic_name="topic",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("/fast", chat_id="-1001", chat_type="supergroup"))
+
+            self.assertFalse(store.load_fast_mode("-1001:thread:7"))
+            self.assertIn("Run /fast inside a Codex session topic", telegram.messages[-1][1])
+
+    def test_fast_off_disables_topic_fast_mode(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            topic_key = "-1001:thread:7"
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key=topic_key,
+                topic_name="topic",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            store.set_fast_mode(topic_key, True)
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("/fast off", chat_id="-1001", message_thread_id=7))
+
+            self.assertFalse(store.load_fast_mode(topic_key))
+            self.assertIn("Fast mode disabled", telegram.messages[-1][1])
+
+    def test_explicit_model_effort_selection_disables_fast_mode(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            topic_key = "-1001:thread:7"
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key=topic_key,
+                topic_name="topic",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            store.set_fast_mode(topic_key, True)
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_callback(self._callback("effort:gpt-5.5:high", chat_id="-1001", message_thread_id=7))
+
+            self.assertFalse(store.load_fast_mode(topic_key))
+            preference = store.load_model_preference(topic_key)
+            self.assertIsNotNone(preference)
+            assert preference is not None
+            self.assertEqual(preference.reasoning_effort, "high")
+
+    def test_fast_mode_uses_lowest_supported_effort_when_low_is_unavailable(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            topic_key = "-1001:thread:7"
+            telegram = FakeTelegram()
+            codex = FakeCodex("fast response")
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key=topic_key,
+                topic_name="topic",
+                workspace="",
+                model="gpt-special",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            store.save_model_preference(topic_key, model="gpt-special", reasoning_effort="high")
+            store.set_fast_mode(topic_key, True)
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=NoLowModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("do it quickly", chat_id="-1001", message_thread_id=7))
+
+            self.assertEqual(codex.runs[-1], ("gpt-special", "medium", root.resolve(), None))
+
+    def test_fast_mode_defaults_to_low_when_model_metadata_is_unavailable(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            topic_key = "-1001:thread:7"
+            telegram = FakeTelegram()
+            codex = FakeCodex("fast response")
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key=topic_key,
+                topic_name="topic",
+                workspace="",
+                model="gpt-missing",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            store.save_model_preference(topic_key, model="gpt-missing", reasoning_effort="high")
+            store.set_fast_mode(topic_key, True)
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=NonAuthoritativeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("do it quickly", chat_id="-1001", message_thread_id=7))
+
+            self.assertEqual(codex.runs[-1], ("gpt-missing", "low", root.resolve(), None))
+
+    def test_reset_preserves_fast_mode_but_clears_history(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            topic_key = "-1001:thread:7"
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key=topic_key,
+                topic_name="topic",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            store.set_fast_mode(topic_key, True)
+            store.append(topic_key, "user", "old")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("/reset", chat_id="-1001", message_thread_id=7))
+
+            self.assertTrue(store.load_fast_mode(topic_key))
+            self.assertEqual(store.load(topic_key), [])
 
     def test_workspace_start_in_topic_clears_compact_summary(self):
         with TemporaryDirectory() as tmp:
