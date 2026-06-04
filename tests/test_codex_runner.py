@@ -141,6 +141,27 @@ class CodexRunnerTests(unittest.TestCase):
             self.assertEqual(command[command.index("--sandbox") + 1], "workspace-write")
             self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", command)
 
+    def test_runner_uses_read_only_sandbox_override(self):
+        with TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            seen: dict[str, object] = {}
+
+            def fake_run(command, **kwargs):
+                seen["command"] = command
+                output_path = Path(command[command.index("--output-last-message") + 1])
+                output_path.write_text("final answer", encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with patch("subprocess.run", side_effect=fake_run):
+                CodexRunner(self._settings(workdir)).run("do work", sandbox_mode="read-only")
+
+            command = seen["command"]
+            self.assertIsInstance(command, list)
+            assert isinstance(command, list)
+            self.assertIn("--sandbox", command)
+            self.assertEqual(command[command.index("--sandbox") + 1], "read-only")
+            self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", command)
+
     def test_runner_uses_yolo_bypass_flag(self):
         with TemporaryDirectory() as tmp:
             workdir = Path(tmp)
@@ -160,6 +181,44 @@ class CodexRunnerTests(unittest.TestCase):
             assert isinstance(command, list)
             self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
             self.assertNotIn("--sandbox", command)
+
+    def test_compact_uses_safe_summary_prompt_and_runtime_overrides(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            selected = root / "project"
+            selected.mkdir()
+            seen: dict[str, object] = {}
+
+            def fake_run(command, **kwargs):
+                seen["command"] = command
+                seen["kwargs"] = kwargs
+                output_path = Path(command[command.index("--output-last-message") + 1])
+                output_path.write_text("summary", encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with patch("subprocess.run", side_effect=fake_run):
+                result = CodexRunner(self._settings(root)).compact(
+                    "User: keep context",
+                    existing_summary="old summary",
+                    model="gpt-5.5",
+                    reasoning_effort="high",
+                    workdir=selected,
+                    sandbox_mode="constrained",
+                )
+
+            prompt = seen["kwargs"]["input"]
+            self.assertIsInstance(prompt, str)
+            assert isinstance(prompt, str)
+            self.assertIn("Summarize this Telegram Codex session", prompt)
+            self.assertIn("Do not include raw code blocks", prompt)
+            self.assertIn("old summary", prompt)
+            self.assertIn("User: keep context", prompt)
+            self.assertEqual(result.text, "summary")
+            command = seen["command"]
+            self.assertIsInstance(command, list)
+            assert isinstance(command, list)
+            self.assertEqual(command[command.index("--model") + 1], "gpt-5.5")
+            self.assertEqual(command[command.index("-C") + 1], str(selected))
 
 
 if __name__ == "__main__":

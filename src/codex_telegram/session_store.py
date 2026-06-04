@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -100,6 +101,9 @@ class SessionStore:
             label = "User" if turn.role == "user" else "Assistant"
             lines.append(f"{label}: {turn.text}")
         return "\n".join(lines)
+
+    def history_char_count(self, chat_id: str) -> int:
+        return sum(len(turn.text) for turn in self.load(chat_id))
 
     def _load_processed(self) -> list[str]:
         if not self._processed_path.exists():
@@ -338,6 +342,39 @@ class SessionStore:
         if not isinstance(session, dict):
             return False
         session["is_closed"] = is_closed
+        self._save_topic_sessions(sessions)
+        return True
+
+    def save_compact_metadata(
+        self,
+        session_key: str,
+        *,
+        summary: str,
+        source_char_count: int,
+        turns_compacted: int,
+        auto: bool,
+        compacted_at: int | None = None,
+    ) -> bool:
+        sessions = self._load_topic_sessions()
+        session = sessions.get(session_key)
+        if not isinstance(session, dict):
+            return False
+        session["compact_metadata"] = {
+            "summary": summary,
+            "source_char_count": source_char_count,
+            "turns_compacted": turns_compacted,
+            "auto": auto,
+            "compacted_at": int(time.time()) if compacted_at is None else compacted_at,
+        }
+        self._save_topic_sessions(sessions)
+        return True
+
+    def clear_compact_metadata(self, session_key: str) -> bool:
+        sessions = self._load_topic_sessions()
+        session = sessions.get(session_key)
+        if not isinstance(session, dict):
+            return False
+        session["compact_metadata"] = {}
         self._save_topic_sessions(sessions)
         return True
 

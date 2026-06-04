@@ -157,6 +157,75 @@ class SessionStoreTests(unittest.TestCase):
             self.assertIsNone(store.load_sandbox_mode(topic_key))
             self.assertEqual(store.load(topic_key), [])
 
+    def test_topic_compact_metadata_round_trip_and_clear(self):
+        with TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            topic_key = "-1001:thread:50"
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=50,
+                session_key=topic_key,
+                topic_name="kitia | gpt-5.5 high | yolo",
+                workspace="kitia",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="yolo",
+            )
+
+            self.assertTrue(
+                store.save_compact_metadata(
+                    topic_key,
+                    summary="summary",
+                    source_char_count=123,
+                    turns_compacted=4,
+                    auto=True,
+                    compacted_at=99,
+                )
+            )
+
+            session = store.load_topic_session(topic_key)
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(
+                session.compact_metadata,
+                {
+                    "summary": "summary",
+                    "source_char_count": 123,
+                    "turns_compacted": 4,
+                    "auto": True,
+                    "compacted_at": 99,
+                },
+            )
+
+            self.assertTrue(store.clear_compact_metadata(topic_key))
+            session = store.load_topic_session(topic_key)
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.compact_metadata, {})
+
+    def test_compact_metadata_requires_existing_topic_session(self):
+        with TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+
+            self.assertFalse(
+                store.save_compact_metadata(
+                    "missing",
+                    summary="summary",
+                    source_char_count=1,
+                    turns_compacted=1,
+                    auto=False,
+                )
+            )
+            self.assertFalse(store.clear_compact_metadata("missing"))
+
+    def test_history_char_count(self):
+        with TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            store.append("chat", "user", "abc")
+            store.append("chat", "assistant", "defg")
+
+            self.assertEqual(store.history_char_count("chat"), 7)
+
 
 if __name__ == "__main__":
     unittest.main()

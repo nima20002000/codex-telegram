@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .codex_runner import CodexRunner
+from .codex_runner import EMPTY_CODEX_RESPONSE, CodexRunner
 from .config import Settings
 from .model_catalog import CodexModelCatalog, ModelChoice
 from .session_store import ChatModelPreference, SessionStore, TopicSession
@@ -20,6 +20,8 @@ from .telegram_api import (
 )
 
 logger = logging.getLogger(__name__)
+
+AUTO_COMPACT_HISTORY_CHARS = 24000
 
 
 SYSTEM_PROMPT = """You are Codex, reached through a Telegram bot bridge.
@@ -72,6 +74,7 @@ class CodexTelegramGateway:
         self._model_catalog = model_catalog or CodexModelCatalog(settings.codex_command)
         self._sessions = sessions
         self._offset: int | None = None
+        self._active_session_keys: set[str] = set()
 
     @staticmethod
     def _session_key(incoming: IncomingMessage | IncomingCallback) -> str:
@@ -638,6 +641,7 @@ class CodexTelegramGateway:
     def _build_codex_prompt(self, message: IncomingMessage) -> str:
         session_key = self._session_key(message)
         history = self._sessions.render_recent(session_key)
+        compact_summary = self._compact_summary_for_session(session_key)
         topic = (
             f" message_thread_id={message.message_thread_id}"
             if message.message_thread_id is not None
@@ -651,15 +655,24 @@ class CodexTelegramGateway:
             f"sandbox={self._sandbox_status_label(session_key)}"
         )
         parts = [SYSTEM_PROMPT.strip(), identity]
+        if compact_summary:
+            parts.append(f"Compacted Telegram conversation context:\n{compact_summary}")
         if history:
             parts.append(history)
         parts.append(f"Current Telegram message:\n{message.text}")
         return "\n\n".join(parts)
 
+    def _compact_summary_for_session(self, session_key: str) -> str:
+        session = self._sessions.load_topic_session(session_key)
+        if session is None:
+            return ""
+        summary = session.compact_metadata.get("summary")
+        return summary if isinstance(summary, str) else ""
+
     def _command_response(self, message: IncomingMessage) -> str | None:
         command = message.text.split(maxsplit=1)[0].split("@", 1)[0].lower()
         if command in {"/start", "/help"}:
-            return "/reset\n/models\n/workspace\n/sandbox"
+            return "/reset\n/compact\n/models\n/workspace\n/sandbox"
         if command == "/status":
             status = self.status(self._session_key(message))
             return (
@@ -671,9 +684,113 @@ class CodexTelegramGateway:
                 f"Sandbox: {status.sandbox}"
             )
         if command == "/reset":
-            self._sessions.reset(self._session_key(message))
+            session_key = self._session_key(message)
+            self._sessions.reset(session_key)
+            self._sessions.clear_compact_metadata(session_key)
             return "This chat's bridge history was reset."
         return None
+
+    def _compact_session(
+        self,
+        message: IncomingMessage,
+        *,
+        auto: bool,
+        reply_to_message_id: int | None,
+    ) -> bool:
+        session_key = self._session_key(message)
+        topic_session = self._sessions.load_topic_session(session_key)
+        if topic_session is None:
+            if not auto:
+                self._telegram.send_message(
+                    message.chat_id,
+                    "Run /compact inside a recorded Codex session topic.",
+                    reply_to_message_id=reply_to_message_id,
+                    message_thread_id=message.message_thread_id,
+                )
+            return False
+        if session_key in self._active_session_keys:
+            self._telegram.send_message(
+                message.chat_id,
+                "This topic already has a Codex run in progress. Try /compact after it finishes.",
+                reply_to_message_id=reply_to_message_id,
+                message_thread_id=message.message_thread_id,
+            )
+            return False
+
+        history = self._sessions.render_recent(session_key)
+        turns = self._sessions.load(session_key)
+        if not history.strip():
+            if not auto:
+                self._telegram.send_message(
+                    message.chat_id,
+                    "There is no conversation context to compact in this topic.",
+                    reply_to_message_id=reply_to_message_id,
+                    message_thread_id=message.message_thread_id,
+                )
+            return False
+
+        self._telegram.send_message(
+            message.chat_id,
+            "conversation compact started",
+            reply_to_message_id=reply_to_message_id,
+            message_thread_id=message.message_thread_id,
+        )
+        preference = self._active_model_preference(session_key)
+        self._active_session_keys.add(session_key)
+        try:
+            result = self._codex.compact(
+                history,
+                existing_summary=self._compact_summary_for_session(session_key),
+                model=preference.model if preference else None,
+                reasoning_effort=preference.reasoning_effort if preference else None,
+                workdir=self._active_workdir(session_key),
+                sandbox_mode="read-only",
+            )
+        finally:
+            self._active_session_keys.discard(session_key)
+
+        summary = result.text.strip()
+        if result.returncode != 0 or not summary or summary == EMPTY_CODEX_RESPONSE:
+            self._telegram.send_message(
+                message.chat_id,
+                "conversation compact failed. The existing topic context was left unchanged.",
+                reply_to_message_id=reply_to_message_id,
+                message_thread_id=message.message_thread_id,
+            )
+            return False
+
+        self._sessions.save_compact_metadata(
+            session_key,
+            summary=summary,
+            source_char_count=len(history),
+            turns_compacted=len(turns),
+            auto=auto,
+        )
+        self._sessions.reset(session_key)
+        self._telegram.send_message(
+            message.chat_id,
+            "conversation compact finished",
+            reply_to_message_id=reply_to_message_id,
+            message_thread_id=message.message_thread_id,
+        )
+        return True
+
+    def _handle_compact_command(self, message: IncomingMessage) -> None:
+        if message.message_thread_id is None:
+            self._telegram.send_message(
+                message.chat_id,
+                "Run /compact inside a Codex session topic. General chat compaction does not compact topic sessions.",
+                reply_to_message_id=message.message_id,
+            )
+            return
+        self._compact_session(message, auto=False, reply_to_message_id=message.message_id)
+
+    def _maybe_auto_compact(self, message: IncomingMessage, session_key: str) -> None:
+        if message.message_thread_id is None:
+            return
+        if self._sessions.history_char_count(session_key) < AUTO_COMPACT_HISTORY_CHARS:
+            return
+        self._compact_session(message, auto=True, reply_to_message_id=message.message_id)
 
     @staticmethod
     def _button(text: str, callback_data: str) -> dict[str, str]:
@@ -744,6 +861,9 @@ class CodexTelegramGateway:
         if command == "/workspace":
             self._send_workspace_browser(message)
             return
+        if command == "/compact":
+            self._handle_compact_command(message)
+            return
 
         command_response = self._command_response(message)
         if command_response is not None:
@@ -759,21 +879,34 @@ class CodexTelegramGateway:
             if self._handle_general_forum_message(message):
                 return
 
-        prompt = self._build_codex_prompt(message)
         session_key = self._session_key(message)
+        if session_key in self._active_session_keys:
+            self._telegram.send_message(
+                message.chat_id,
+                "This topic already has a Codex run in progress. Please wait for it to finish.",
+                reply_to_message_id=message.message_id,
+                message_thread_id=message.message_thread_id,
+            )
+            return
+        self._maybe_auto_compact(message, session_key)
+        prompt = self._build_codex_prompt(message)
         self._sessions.append(session_key, "user", message.text)
         try:
             self._telegram.send_chat_action(message.chat_id, message_thread_id=message.message_thread_id)
         except Exception:
             logger.warning("Failed to send Telegram typing indicator", exc_info=True)
         preference = self._active_model_preference(session_key)
-        result = self._codex.run(
-            prompt,
-            model=preference.model if preference else None,
-            reasoning_effort=preference.reasoning_effort if preference else None,
-            workdir=self._active_workdir(session_key),
-            sandbox_mode=self._active_sandbox_mode(session_key),
-        )
+        self._active_session_keys.add(session_key)
+        try:
+            result = self._codex.run(
+                prompt,
+                model=preference.model if preference else None,
+                reasoning_effort=preference.reasoning_effort if preference else None,
+                workdir=self._active_workdir(session_key),
+                sandbox_mode=self._active_sandbox_mode(session_key),
+            )
+        finally:
+            self._active_session_keys.discard(session_key)
         response = result.text.strip()
         if len(response) > self._settings.max_telegram_response_chars:
             response = response[: self._settings.max_telegram_response_chars].rstrip()
@@ -853,6 +986,7 @@ class CodexTelegramGateway:
             if action == "s":
                 self._sessions.save_active_workspace(session_key, self._workspace_relative_path(path))
                 self._sessions.reset(session_key)
+                self._sessions.clear_compact_metadata(session_key)
                 self._telegram.answer_callback_query(callback.callback_query_id, text="Session started.")
                 status = self.status(session_key)
                 self._reply_to_callback(

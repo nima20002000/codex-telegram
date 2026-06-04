@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from codex_telegram.codex_runner import CodexResult
+from codex_telegram.codex_runner import EMPTY_CODEX_RESPONSE, CodexResult
 from codex_telegram.config import Settings
 from codex_telegram.gateway import CodexTelegramGateway
 from codex_telegram.model_catalog import ModelChoice
@@ -99,12 +99,30 @@ class FakeCodex:
     def __init__(self, response="done"):
         self.prompts: list[str] = []
         self.runs: list[tuple[str | None, str | None, Path | None, str | None]] = []
+        self.compact_prompts: list[str] = []
+        self.compact_runs: list[tuple[str | None, str | None, Path | None, str | None]] = []
+        self.compact_response = "compacted summary"
+        self.compact_returncode = 0
         self.response = response
 
     def run(self, prompt, *, model=None, reasoning_effort=None, workdir=None, sandbox_mode=None):
         self.prompts.append(prompt)
         self.runs.append((model, reasoning_effort, workdir, sandbox_mode))
         return CodexResult(text=self.response, returncode=0, stderr="")
+
+    def compact(
+        self,
+        conversation_context,
+        *,
+        existing_summary="",
+        model=None,
+        reasoning_effort=None,
+        workdir=None,
+        sandbox_mode=None,
+    ):
+        self.compact_prompts.append(f"existing={existing_summary}\n{conversation_context}")
+        self.compact_runs.append((model, reasoning_effort, workdir, sandbox_mode))
+        return CodexResult(text=self.compact_response, returncode=self.compact_returncode, stderr="")
 
 
 class FakeModelCatalog:
@@ -214,7 +232,7 @@ class GatewayTests(unittest.TestCase):
             gateway.handle_message(self._message("/help"))
 
             self.assertEqual(len(codex.prompts), 0)
-            self.assertEqual(telegram.messages[0][1], "/reset\n/models\n/workspace\n/sandbox")
+            self.assertEqual(telegram.messages[0][1], "/reset\n/compact\n/models\n/workspace\n/sandbox")
 
     def test_status_command_shows_status(self):
         with TemporaryDirectory() as tmp:
@@ -561,6 +579,346 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual([turn.text for turn in store.load("-1001:thread:8")], ["topic eight"])
             self.assertEqual([turn.text for turn in store.load("-1001")], ["general"])
             self.assertEqual(telegram.message_threads[-1], 7)
+
+    def test_reset_command_in_topic_clears_compact_summary_only_for_that_topic(self):
+        with TemporaryDirectory() as tmp:
+            telegram = FakeTelegram()
+            store = SessionStore(Path(tmp) / "state")
+            for thread_id in (7, 8):
+                key = f"-1001:thread:{thread_id}"
+                store.save_topic_session(
+                    chat_id="-1001",
+                    message_thread_id=thread_id,
+                    session_key=key,
+                    topic_name=f"topic {thread_id}",
+                    workspace="",
+                    model="gpt-5.5",
+                    reasoning_effort="high",
+                    sandbox_mode="constrained",
+                )
+                store.save_compact_metadata(
+                    key,
+                    summary=f"summary {thread_id}",
+                    source_char_count=10,
+                    turns_compacted=1,
+                    auto=False,
+                    compacted_at=1,
+                )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(Path(tmp)),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("/reset", chat_id="-1001", message_thread_id=7))
+
+            seven = store.load_topic_session("-1001:thread:7")
+            eight = store.load_topic_session("-1001:thread:8")
+            self.assertIsNotNone(seven)
+            self.assertIsNotNone(eight)
+            assert seven is not None and eight is not None
+            self.assertEqual(seven.compact_metadata, {})
+            self.assertEqual(eight.compact_metadata["summary"], "summary 8")
+
+    def test_compact_command_in_topic_persists_summary_and_clears_raw_history(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            topic_key = "-1001:thread:7"
+            telegram = FakeTelegram()
+            codex = FakeCodex()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key=topic_key,
+                topic_name="kitia topic",
+                workspace="kitia",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="yolo",
+            )
+            store.save_active_workspace(topic_key, "kitia")
+            store.save_model_preference(topic_key, model="gpt-5.5", reasoning_effort="high")
+            store.save_sandbox_mode(topic_key, "yolo")
+            store.append(topic_key, "user", "remember alpha")
+            store.append(topic_key, "assistant", "alpha done")
+            (root / "kitia").mkdir()
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("/compact", chat_id="-1001", message_thread_id=7))
+
+            self.assertEqual(telegram.messages[-2][1], "conversation compact started")
+            self.assertEqual(telegram.messages[-1][1], "conversation compact finished")
+            self.assertEqual(telegram.message_threads[-2:], [7, 7])
+            self.assertIn("remember alpha", codex.compact_prompts[0])
+            self.assertEqual(codex.compact_runs[-1], ("gpt-5.5", "high", (root / "kitia").resolve(), "read-only"))
+            topic_session = store.load_topic_session(topic_key)
+            self.assertIsNotNone(topic_session)
+            assert topic_session is not None
+            self.assertEqual(topic_session.compact_metadata["summary"], "compacted summary")
+            self.assertFalse(topic_session.compact_metadata["auto"])
+            self.assertEqual(store.load(topic_key), [])
+
+    def test_compact_command_in_general_chat_does_not_compact_topics(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key="-1001:thread:7",
+                topic_name="kitia topic",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            store.append("-1001:thread:7", "user", "topic context")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("/compact", chat_id="-1001", chat_type="supergroup"))
+
+            self.assertEqual(codex.compact_prompts, [])
+            self.assertIn("General chat compaction does not compact topic sessions", telegram.messages[-1][1])
+            self.assertEqual([turn.text for turn in store.load("-1001:thread:7")], ["topic context"])
+
+    def test_compact_command_reports_empty_topic_context(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key="-1001:thread:7",
+                topic_name="kitia topic",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("/compact", chat_id="-1001", message_thread_id=7))
+
+            self.assertEqual(codex.compact_prompts, [])
+            self.assertIn("no conversation context", telegram.messages[-1][1])
+
+    def test_compact_failure_leaves_existing_context_unchanged(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            topic_key = "-1001:thread:7"
+            telegram = FakeTelegram()
+            codex = FakeCodex()
+            codex.compact_returncode = 1
+            codex.compact_response = "Codex failed"
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key=topic_key,
+                topic_name="kitia topic",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            store.append(topic_key, "user", "keep me")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("/compact", chat_id="-1001", message_thread_id=7))
+
+            self.assertIn("conversation compact failed", telegram.messages[-1][1])
+            self.assertEqual([turn.text for turn in store.load(topic_key)], ["keep me"])
+            topic_session = store.load_topic_session(topic_key)
+            self.assertIsNotNone(topic_session)
+            assert topic_session is not None
+            self.assertEqual(topic_session.compact_metadata, {})
+
+    def test_compact_empty_codex_output_leaves_existing_context_unchanged(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            topic_key = "-1001:thread:7"
+            telegram = FakeTelegram()
+            codex = FakeCodex()
+            codex.compact_response = EMPTY_CODEX_RESPONSE
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key=topic_key,
+                topic_name="kitia topic",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            store.append(topic_key, "user", "keep me")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("/compact", chat_id="-1001", message_thread_id=7))
+
+            self.assertIn("conversation compact failed", telegram.messages[-1][1])
+            self.assertEqual([turn.text for turn in store.load(topic_key)], ["keep me"])
+            topic_session = store.load_topic_session(topic_key)
+            self.assertIsNotNone(topic_session)
+            assert topic_session is not None
+            self.assertEqual(topic_session.compact_metadata, {})
+
+    def test_future_topic_prompt_includes_compact_summary_without_old_raw_history(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            topic_key = "-1001:thread:7"
+            telegram = FakeTelegram()
+            codex = FakeCodex()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key=topic_key,
+                topic_name="kitia topic",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            store.save_compact_metadata(
+                topic_key,
+                summary="summary says alpha matters",
+                source_char_count=100,
+                turns_compacted=2,
+                auto=False,
+                compacted_at=1,
+            )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("continue", chat_id="-1001", message_thread_id=7))
+
+            self.assertIn("Compacted Telegram conversation context", codex.prompts[-1])
+            self.assertIn("summary says alpha matters", codex.prompts[-1])
+            self.assertNotIn("User: continue", codex.prompts[-1])
+
+    def test_auto_compact_runs_before_topic_message_when_history_is_large(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            topic_key = "-1001:thread:7"
+            telegram = FakeTelegram()
+            codex = FakeCodex("after compact")
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key=topic_key,
+                topic_name="kitia topic",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            store.append(topic_key, "user", "x" * 25000)
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("continue after compaction", chat_id="-1001", message_thread_id=7))
+
+            self.assertEqual(len(codex.compact_prompts), 1)
+            topic_session = store.load_topic_session(topic_key)
+            self.assertIsNotNone(topic_session)
+            assert topic_session is not None
+            self.assertTrue(topic_session.compact_metadata["auto"])
+            self.assertEqual([turn.text for turn in store.load(topic_key)], ["continue after compaction", "after compact"])
+            self.assertIn("compacted summary", codex.prompts[-1])
+
+    def test_workspace_start_in_topic_clears_compact_summary(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            avatar = root / "avatar"
+            avatar.mkdir()
+            topic_key = "-1001:thread:7"
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key=topic_key,
+                topic_name="kitia topic",
+                workspace="kitia",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            store.save_compact_metadata(
+                topic_key,
+                summary="stale summary",
+                source_char_count=100,
+                turns_compacted=2,
+                auto=False,
+                compacted_at=1,
+            )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(self._message("/workspace", chat_id="-1001", message_thread_id=7))
+            avatar_button = telegram.reply_markups[0]["inline_keyboard"][1][0]
+            gateway.handle_callback(self._callback(avatar_button["callback_data"], chat_id="-1001", message_thread_id=7))
+            start_button = telegram.edits[0][3]["inline_keyboard"][0][0]
+            gateway.handle_callback(self._callback(start_button["callback_data"], chat_id="-1001", message_thread_id=7))
+
+            session = store.load_topic_session(topic_key)
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.compact_metadata, {})
 
     def test_general_forum_message_creates_configured_topic_session(self):
         with TemporaryDirectory() as tmp:

@@ -13,6 +13,7 @@ from .telegram_api import TelegramAPI, TelegramAPIError
 
 BOT_COMMANDS = [
     ("/reset", "Reset"),
+    ("/compact", "Compact context"),
     ("/models", "Models"),
     ("/workspace", "Workspace"),
     ("/sandbox", "Sandbox"),

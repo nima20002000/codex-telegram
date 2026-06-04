@@ -113,11 +113,17 @@ deployment check must prove the service is running a specific commit.
 ## Commands
 
 - `/reset`
+- `/compact`
 - `/models`
 - `/workspace`
 - `/sandbox`
 
 Any other text message is sent to `codex exec`.
+
+`/compact` is for topic-backed Codex sessions. It summarizes that topic's saved
+Telegram conversation context, stores the compact summary locally, clears the
+raw recent history for that topic, and keeps later messages in that topic using
+the compacted context. General chat `/compact` does not compact topic sessions.
 
 `/workspace` opens an inline folder browser rooted at `CODEX_WORKDIR`. Use folder
 buttons to move into child directories, then press `Start session` to make later

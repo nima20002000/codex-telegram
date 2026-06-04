@@ -7,6 +7,8 @@ from pathlib import Path
 
 from .config import Settings
 
+EMPTY_CODEX_RESPONSE = "(Codex produced no final response.)"
+
 
 @dataclass(frozen=True)
 class CodexResult:
@@ -41,7 +43,12 @@ class CodexRunner:
         if sandbox_mode == "yolo":
             args[2:2] = ["--dangerously-bypass-approvals-and-sandbox"]
         else:
-            sandbox = "workspace-write" if sandbox_mode == "constrained" else self._settings.codex_sandbox
+            if sandbox_mode == "constrained":
+                sandbox = "workspace-write"
+            elif sandbox_mode == "read-only":
+                sandbox = "read-only"
+            else:
+                sandbox = self._settings.codex_sandbox
             args[2:2] = ["--sandbox", sandbox]
         selected_model = model or self._settings.codex_model
         if selected_model:
@@ -107,7 +114,34 @@ class CodexRunner:
                 error = completed.stderr.strip() or completed.stdout.strip() or "Codex exited with an error."
                 output_text = f"Codex failed with exit code {completed.returncode}.\n\n{error}"
             return CodexResult(
-                text=output_text or "(Codex produced no final response.)",
+                text=output_text or EMPTY_CODEX_RESPONSE,
                 returncode=completed.returncode,
                 stderr=completed.stderr.strip(),
             )
+
+    def compact(
+        self,
+        conversation_context: str,
+        *,
+        existing_summary: str = "",
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        workdir: Path | None = None,
+        sandbox_mode: str | None = None,
+    ) -> CodexResult:
+        sections = [
+            "Summarize this Telegram Codex session for future context.",
+            "Preserve user goals, decisions, constraints, files touched, commands run, and unresolved next steps.",
+            "Do not include raw code blocks, raw diffs, secrets, tokens, private chat ids, or long command output.",
+            "Write a concise factual summary that can be prepended to a later Codex prompt.",
+        ]
+        if existing_summary:
+            sections.append(f"Existing compact summary:\n{existing_summary}")
+        sections.append(f"Recent conversation to compact:\n{conversation_context}")
+        return self.run(
+            "\n\n".join(sections),
+            model=model,
+            reasoning_effort=reasoning_effort,
+            workdir=workdir,
+            sandbox_mode=sandbox_mode,
+        )

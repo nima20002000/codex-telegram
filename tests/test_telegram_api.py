@@ -223,6 +223,7 @@ class TelegramAPITests(unittest.TestCase):
         telegram.set_bot_commands(
             [
                 ("/reset", "Reset"),
+                ("/compact", "Compact context"),
                 ("/models", "Models"),
                 ("/workspace", "Workspace"),
                 ("/sandbox", "Sandbox"),
@@ -237,6 +238,7 @@ class TelegramAPITests(unittest.TestCase):
                     {
                         "commands": [
                             {"command": "reset", "description": "Reset"},
+                            {"command": "compact", "description": "Compact context"},
                             {"command": "models", "description": "Models"},
                             {"command": "workspace", "description": "Workspace"},
                             {"command": "sandbox", "description": "Sandbox"},
