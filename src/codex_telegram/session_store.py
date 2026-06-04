@@ -22,6 +22,18 @@ class ChatModelPreference:
     reasoning_effort: str
 
 
+@dataclass(frozen=True)
+class TopicSession:
+    chat_id: str
+    message_thread_id: int
+    session_key: str
+    topic_name: str
+    workspace: str
+    model: str
+    reasoning_effort: str
+    sandbox_mode: str
+
+
 def _safe_chat_key(chat_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", chat_id).strip("_") or "chat"
 
@@ -37,6 +49,7 @@ class SessionStore:
         self._sandbox_preferences_path = state_dir / "sandbox_preferences.json"
         self._workspaces_path = state_dir / "workspaces.json"
         self._workspace_tokens_path = state_dir / "workspace_tokens.json"
+        self._topic_sessions_path = state_dir / "topic_sessions.json"
 
     def _path(self, chat_id: str) -> Path:
         return self._sessions_dir / f"{_safe_chat_key(chat_id)}.json"
@@ -205,3 +218,74 @@ class SessionStore:
 
     def resolve_workspace_token(self, token: str) -> str | None:
         return self._load_string_map(self._workspace_tokens_path).get(token)
+
+    def _load_topic_sessions(self) -> dict[str, dict[str, object]]:
+        if not self._topic_sessions_path.exists():
+            return {}
+        raw = json.loads(self._topic_sessions_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+        return {str(key): value for key, value in raw.items() if isinstance(value, dict)}
+
+    def _save_topic_sessions(self, sessions: dict[str, dict[str, object]]) -> None:
+        self._topic_sessions_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._topic_sessions_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(sessions, indent=2), encoding="utf-8")
+        tmp.replace(self._topic_sessions_path)
+
+    def save_topic_session(
+        self,
+        *,
+        chat_id: str,
+        message_thread_id: int,
+        session_key: str,
+        topic_name: str,
+        workspace: str,
+        model: str,
+        reasoning_effort: str,
+        sandbox_mode: str,
+    ) -> None:
+        sessions = self._load_topic_sessions()
+        sessions[session_key] = {
+            "chat_id": chat_id,
+            "message_thread_id": message_thread_id,
+            "session_key": session_key,
+            "topic_name": topic_name,
+            "workspace": workspace,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "sandbox_mode": sandbox_mode,
+        }
+        self._save_topic_sessions(sessions)
+
+    def load_topic_session(self, session_key: str) -> TopicSession | None:
+        raw = self._load_topic_sessions().get(session_key)
+        if raw is None:
+            return None
+        chat_id = raw.get("chat_id")
+        message_thread_id = raw.get("message_thread_id")
+        topic_name = raw.get("topic_name")
+        workspace = raw.get("workspace")
+        model = raw.get("model")
+        reasoning_effort = raw.get("reasoning_effort")
+        sandbox_mode = raw.get("sandbox_mode")
+        if not (
+            isinstance(chat_id, str)
+            and isinstance(message_thread_id, int)
+            and isinstance(topic_name, str)
+            and isinstance(workspace, str)
+            and isinstance(model, str)
+            and isinstance(reasoning_effort, str)
+            and isinstance(sandbox_mode, str)
+        ):
+            return None
+        return TopicSession(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            session_key=session_key,
+            topic_name=topic_name,
+            workspace=workspace,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            sandbox_mode=sandbox_mode,
+        )

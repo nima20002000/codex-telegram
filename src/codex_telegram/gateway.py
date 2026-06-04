@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,7 +10,14 @@ from .codex_runner import CodexRunner
 from .config import Settings
 from .model_catalog import CodexModelCatalog, ModelChoice
 from .session_store import ChatModelPreference, SessionStore
-from .telegram_api import IncomingCallback, IncomingMessage, TelegramAPI, parse_callback_update, parse_message_update
+from .telegram_api import (
+    IncomingCallback,
+    IncomingMessage,
+    TelegramAPI,
+    TelegramAPIError,
+    parse_callback_update,
+    parse_message_update,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +37,16 @@ class GatewayStatus:
     model: str
     reasoning_effort: str
     sandbox: str
+
+
+@dataclass(frozen=True)
+class SessionProvisioningRequest:
+    workspace_path: Path
+    workspace_relative: str
+    model: ModelChoice
+    reasoning_effort: str
+    sandbox_mode: str
+    topic_name: str
 
 
 class CodexTelegramGateway:
@@ -125,6 +143,201 @@ class CodexTelegramGateway:
 
     def _workspace_text(self, path: Path) -> str:
         return f"Workspace:\n{path}"
+
+    @staticmethod
+    def _normalize_lookup(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+    @staticmethod
+    def _clean_workspace_phrase(value: str) -> str:
+        cleaned = value.strip().strip("'\"`")
+        for suffix in (" folder", " directory", " repo", " repository", " workspace"):
+            if cleaned.lower().endswith(suffix):
+                cleaned = cleaned[: -len(suffix)].strip()
+                break
+        return cleaned
+
+    def _resolve_requested_workspace(self, value: str) -> tuple[Path, str] | None:
+        cleaned = self._clean_workspace_phrase(value)
+        if not cleaned:
+            return None
+        path = self._workspace_path(cleaned)
+        if path is not None:
+            return path, self._workspace_relative_path(path)
+
+        root = self._settings.codex_workdir.resolve()
+        for child in self._child_workspaces(root):
+            if child.name.lower() == cleaned.lower():
+                return child.resolve(), self._workspace_relative_path(child)
+        return None
+
+    def _resolve_requested_model(self, text: str) -> ModelChoice | None:
+        normalized_text = self._normalize_lookup(text)
+        matches: dict[str, tuple[int, ModelChoice]] = {}
+        for model in self._model_catalog.list_models():
+            names = {model.slug, model.display_name}
+            for name in names:
+                normalized_name = self._normalize_lookup(name)
+                if normalized_name and normalized_name in normalized_text:
+                    current = matches.get(model.slug)
+                    if current is None or len(normalized_name) > current[0]:
+                        matches[model.slug] = (len(normalized_name), model)
+                    break
+        if not matches:
+            return None
+        best_length = max(length for length, _ in matches.values())
+        best_matches = [model for length, model in matches.values() if length == best_length]
+        if len(best_matches) != 1:
+            return None
+        return best_matches[0]
+
+    @staticmethod
+    def _extract_reasoning_effort(text: str) -> str | None:
+        normalized_text = re.sub(r"[^a-z0-9]+", " ", text.lower())
+        if re.search(r"\bx\s*high\b|\bxhigh\b", normalized_text):
+            return "xhigh"
+        for effort in ("high", "medium", "low"):
+            if re.search(rf"\b{effort}\b", normalized_text):
+                return effort
+        return None
+
+    @staticmethod
+    def _extract_sandbox_mode(text: str) -> str | None:
+        normalized_text = re.sub(r"[^a-z0-9]+", " ", text.lower())
+        if re.search(r"\byolo\b|\bdanger full access\b|\bbypass\b", normalized_text):
+            return "yolo"
+        if re.search(r"\bconstrained\b|\bworkspace write\b|\bsafe\b", normalized_text):
+            return "constrained"
+        return None
+
+    def _extract_workspace_phrase(self, text: str) -> str | None:
+        match = re.search(
+            r"\bin\s+(.+?)(?:\s+with\b|\s+using\b|\s+on\b|\s+for\b|$)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            return None
+        return self._clean_workspace_phrase(match.group(1))
+
+    def _topic_name_for(self, request: SessionProvisioningRequest) -> str:
+        workspace = request.workspace_relative or request.workspace_path.name
+        name = f"{workspace} | {request.model.slug} {request.reasoning_effort} | {request.sandbox_mode}"
+        return name[:128]
+
+    def _parse_session_provisioning_request(self, text: str) -> tuple[SessionProvisioningRequest | None, str | None]:
+        lowered = text.lower()
+        if "session" not in lowered and "agent" not in lowered:
+            return None, (
+                "General chat is for creating and managing Codex sessions. "
+                "Try: make me a session in kitia folder with gpt 5.5 high in yolo mode"
+            )
+
+        workspace_phrase = self._extract_workspace_phrase(text)
+        if workspace_phrase is None:
+            return None, "I need a workspace. Example: make me a session in kitia folder with gpt 5.5 high in yolo mode"
+        workspace = self._resolve_requested_workspace(workspace_phrase)
+        if workspace is None:
+            return None, f"I could not find a workspace named `{workspace_phrase}` under {self._settings.codex_workdir}."
+        workspace_path, workspace_relative = workspace
+
+        model = self._resolve_requested_model(text)
+        if model is None:
+            return None, "I need exactly one available model name, for example `gpt 5.5`."
+
+        reasoning_effort = self._extract_reasoning_effort(text)
+        if reasoning_effort is None:
+            return None, "I need a thinking effort: low, medium, high, or xhigh."
+        if reasoning_effort not in model.reasoning_efforts:
+            return None, f"`{model.slug}` does not support `{reasoning_effort}` thinking."
+
+        sandbox_mode = self._extract_sandbox_mode(text)
+        if sandbox_mode is None:
+            return None, "I need a sandbox mode: constrained or yolo."
+
+        placeholder = SessionProvisioningRequest(
+            workspace_path=workspace_path,
+            workspace_relative=workspace_relative,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            sandbox_mode=sandbox_mode,
+            topic_name="",
+        )
+        return (
+            SessionProvisioningRequest(
+                workspace_path=workspace_path,
+                workspace_relative=workspace_relative,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                sandbox_mode=sandbox_mode,
+                topic_name=self._topic_name_for(placeholder),
+            ),
+            None,
+        )
+
+    def _is_general_forum_message(self, message: IncomingMessage) -> bool:
+        return message.chat_type == "supergroup" and message.message_thread_id is None
+
+    def _handle_general_forum_message(self, message: IncomingMessage) -> bool:
+        request, error = self._parse_session_provisioning_request(message.text)
+        if request is None:
+            self._telegram.send_message(
+                message.chat_id,
+                error or "I could not understand that session request.",
+                reply_to_message_id=message.message_id,
+            )
+            return True
+
+        try:
+            topic = self._telegram.create_forum_topic(message.chat_id, request.topic_name)
+        except TelegramAPIError:
+            logger.warning("Failed to create Telegram forum topic chat=%s", message.chat_id, exc_info=True)
+            self._telegram.send_message(
+                message.chat_id,
+                "I could not create a forum topic for that session. "
+                "Check that topics are enabled and the bot can manage topics.",
+                reply_to_message_id=message.message_id,
+            )
+            return True
+        topic_key = f"{message.chat_id}:thread:{topic.message_thread_id}"
+        self._sessions.save_active_workspace(topic_key, request.workspace_relative)
+        self._sessions.save_model_preference(
+            topic_key,
+            model=request.model.slug,
+            reasoning_effort=request.reasoning_effort,
+        )
+        self._sessions.save_sandbox_mode(topic_key, request.sandbox_mode)
+        self._sessions.reset(topic_key)
+        self._sessions.save_topic_session(
+            chat_id=message.chat_id,
+            message_thread_id=topic.message_thread_id,
+            session_key=topic_key,
+            topic_name=topic.name,
+            workspace=request.workspace_relative,
+            model=request.model.slug,
+            reasoning_effort=request.reasoning_effort,
+            sandbox_mode=request.sandbox_mode,
+        )
+
+        ready_text = (
+            "Session ready.\n"
+            f"Workspace: {request.workspace_path}\n"
+            f"Model: {request.model.slug}\n"
+            f"Thinking: {request.reasoning_effort}\n"
+            f"Sandbox: {request.sandbox_mode}\n\n"
+            "Send messages in this topic to talk to this agent."
+        )
+        self._telegram.send_message(
+            message.chat_id,
+            ready_text,
+            message_thread_id=topic.message_thread_id,
+        )
+        self._telegram.send_message(
+            message.chat_id,
+            f"Created topic `{topic.name}` and configured the Codex session there.",
+            reply_to_message_id=message.message_id,
+        )
+        return True
 
     def _active_model_preference(self, chat_id: str | None) -> ChatModelPreference | None:
         if chat_id is None:
@@ -294,6 +507,10 @@ class CodexTelegramGateway:
                 message_thread_id=message.message_thread_id,
             )
             return
+
+        if self._is_general_forum_message(message):
+            if self._handle_general_forum_message(message):
+                return
 
         prompt = self._build_codex_prompt(message)
         session_key = self._session_key(message)

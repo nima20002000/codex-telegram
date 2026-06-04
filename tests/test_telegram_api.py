@@ -9,9 +9,12 @@ class RecordingTelegramAPI(TelegramAPI):
     def __init__(self):
         super().__init__("token")
         self.requests: list[tuple[str, dict]] = []
+        self.responses: dict[str, dict] = {}
 
     def _request(self, method, params):
         self.requests.append((method, params))
+        if method in self.responses:
+            return self.responses[method]
         return {"ok": True, "result": True}
 
 
@@ -85,6 +88,27 @@ class TelegramAPITests(unittest.TestCase):
                         "disable_web_page_preview": True,
                         "reply_markup": None,
                     },
+                )
+            ],
+        )
+
+    def test_create_forum_topic_returns_thread_id_and_name(self):
+        telegram = RecordingTelegramAPI()
+        telegram.responses["createForumTopic"] = {
+            "ok": True,
+            "result": {"message_thread_id": 50, "name": "kitia | gpt-5.5 high | yolo"},
+        }
+
+        topic = telegram.create_forum_topic("-1001", "kitia | gpt-5.5 high | yolo")
+
+        self.assertEqual(topic.message_thread_id, 50)
+        self.assertEqual(topic.name, "kitia | gpt-5.5 high | yolo")
+        self.assertEqual(
+            telegram.requests,
+            [
+                (
+                    "createForumTopic",
+                    {"chat_id": "-1001", "name": "kitia | gpt-5.5 high | yolo"},
                 )
             ],
         )

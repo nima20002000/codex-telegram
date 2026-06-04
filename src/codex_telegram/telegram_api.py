@@ -13,6 +13,12 @@ class TelegramAPIError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ForumTopic:
+    message_thread_id: int
+    name: str
+
+
+@dataclass(frozen=True)
 class IncomingMessage:
     update_id: int
     chat_id: str
@@ -165,6 +171,17 @@ class TelegramAPI:
                 ],
             },
         )
+
+    def create_forum_topic(self, chat_id: str, name: str) -> ForumTopic:
+        payload = self._request("createForumTopic", {"chat_id": chat_id, "name": name})
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            raise TelegramAPIError(f"Telegram createForumTopic returned unexpected result: {payload}")
+        message_thread_id = result.get("message_thread_id")
+        topic_name = result.get("name")
+        if not isinstance(message_thread_id, int) or not isinstance(topic_name, str):
+            raise TelegramAPIError(f"Telegram createForumTopic returned incomplete result: {payload}")
+        return ForumTopic(message_thread_id=message_thread_id, name=topic_name)
 
     def send_message(
         self,

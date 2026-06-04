@@ -83,6 +83,33 @@ class SessionStoreTests(unittest.TestCase):
             self.assertEqual(store.resolve_workspace_token(token), "avatar/project")
             self.assertLessEqual(len(token), 16)
 
+    def test_topic_session_round_trip(self):
+        with TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=50,
+                session_key="-1001:thread:50",
+                topic_name="kitia | gpt-5.5 high | yolo",
+                workspace="kitia",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="yolo",
+            )
+
+            session = store.load_topic_session("-1001:thread:50")
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.chat_id, "-1001")
+            self.assertEqual(session.message_thread_id, 50)
+            self.assertEqual(session.session_key, "-1001:thread:50")
+            self.assertEqual(session.topic_name, "kitia | gpt-5.5 high | yolo")
+            self.assertEqual(session.workspace, "kitia")
+            self.assertEqual(session.model, "gpt-5.5")
+            self.assertEqual(session.reasoning_effort, "high")
+            self.assertEqual(session.sandbox_mode, "yolo")
+
 
 if __name__ == "__main__":
     unittest.main()

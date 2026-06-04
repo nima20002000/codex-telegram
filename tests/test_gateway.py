@@ -9,7 +9,7 @@ from codex_telegram.config import Settings
 from codex_telegram.gateway import CodexTelegramGateway
 from codex_telegram.model_catalog import ModelChoice
 from codex_telegram.session_store import SessionStore
-from codex_telegram.telegram_api import IncomingCallback, IncomingMessage
+from codex_telegram.telegram_api import ForumTopic, IncomingCallback, IncomingMessage, TelegramAPIError
 
 
 class FakeTelegram:
@@ -17,17 +17,28 @@ class FakeTelegram:
         self.messages: list[tuple[str, str, int | None]] = []
         self.message_threads: list[int | None] = []
         self.reply_markups: list[dict | None] = []
+        self.created_topics: list[tuple[str, str]] = []
+        self.next_thread_id = 50
         self.edits: list[tuple[str, int, str, dict | None]] = []
         self.callback_answers: list[tuple[str, str | None]] = []
         self.actions: list[str] = []
         self.updates = list(updates or [])
         self.calls: list[tuple[int | None, int]] = []
         self.fail_chat_action = False
+        self.fail_create_forum_topic = False
 
     def send_message(self, chat_id, text, *, reply_to_message_id=None, message_thread_id=None, reply_markup=None):
         self.messages.append((chat_id, text, reply_to_message_id))
         self.message_threads.append(message_thread_id)
         self.reply_markups.append(reply_markup)
+
+    def create_forum_topic(self, chat_id, name):
+        if self.fail_create_forum_topic:
+            raise TelegramAPIError("missing manage topics permission")
+        self.created_topics.append((chat_id, name))
+        topic = ForumTopic(message_thread_id=self.next_thread_id, name=name)
+        self.next_thread_id += 1
+        return topic
 
     def edit_message_text(self, chat_id, message_id, text, *, reply_markup=None):
         self.edits.append((chat_id, message_id, text, reply_markup))
@@ -83,6 +94,14 @@ class NonAuthoritativeModelCatalog(FakeModelCatalog):
         return False
 
 
+class PrefixModelCatalog(FakeModelCatalog):
+    def __init__(self):
+        self.models = (
+            ModelChoice("gpt-5.4", "GPT-5.4", ("low", "medium", "high"), "medium"),
+            ModelChoice("gpt-5.4-mini", "GPT-5.4-Mini", ("low", "medium", "high"), "medium"),
+        )
+
+
 class GatewayTests(unittest.TestCase):
     def _settings(
         self,
@@ -109,7 +128,15 @@ class GatewayTests(unittest.TestCase):
             state_dir=workdir / ".state",
         )
 
-    def _message(self, text: str, *, user_id=42, chat_id="100", message_thread_id=None) -> IncomingMessage:
+    def _message(
+        self,
+        text: str,
+        *,
+        user_id=42,
+        chat_id="100",
+        chat_type="private",
+        message_thread_id=None,
+    ) -> IncomingMessage:
         return IncomingMessage(
             update_id=1,
             chat_id=chat_id,
@@ -117,7 +144,7 @@ class GatewayTests(unittest.TestCase):
             username="nima",
             text=text,
             message_id=9,
-            chat_type="private",
+            chat_type=chat_type,
             message_thread_id=message_thread_id,
         )
 
@@ -474,6 +501,172 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual([turn.role for turn in store.load("-1001:thread:7")], ["user", "assistant"])
             self.assertEqual(store.load("-1001"), [])
             self.assertIn("message_thread_id=7", codex.prompts[0])
+
+    def test_general_forum_message_creates_configured_topic_session(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kitia = root / "kitia"
+            kitia.mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex("finished")
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make me a session in kitia folder with gpt 5.5 high in yolo mode",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            topic_key = "-1001:thread:50"
+            self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
+            self.assertEqual(codex.prompts, [])
+            self.assertEqual(store.load_active_workspace(topic_key), "kitia")
+            self.assertEqual(store.load_sandbox_mode(topic_key), "yolo")
+            preference = store.load_model_preference(topic_key)
+            self.assertIsNotNone(preference)
+            assert preference is not None
+            self.assertEqual(preference.model, "gpt-5.5")
+            self.assertEqual(preference.reasoning_effort, "high")
+            topic_session = store.load_topic_session(topic_key)
+            self.assertIsNotNone(topic_session)
+            assert topic_session is not None
+            self.assertEqual(topic_session.workspace, "kitia")
+            self.assertEqual(topic_session.model, "gpt-5.5")
+            self.assertEqual(topic_session.reasoning_effort, "high")
+            self.assertEqual(topic_session.sandbox_mode, "yolo")
+            self.assertIn("Session ready.", telegram.messages[0][1])
+            self.assertIn(f"Workspace: {kitia.resolve()}", telegram.messages[0][1])
+            self.assertEqual(telegram.message_threads[0], 50)
+            self.assertIn("Created topic `kitia | gpt-5.5 high | yolo`", telegram.messages[1][1])
+            self.assertEqual(telegram.message_threads[1], None)
+
+    def test_general_forum_message_rejects_unrecognized_session_request(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex("finished")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            gateway.handle_message(
+                self._message("hello there", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.created_topics, [])
+            self.assertEqual(codex.prompts, [])
+            self.assertIn("General chat is for creating", telegram.messages[0][1])
+            self.assertEqual(telegram.messages[0][2], 9)
+
+    def test_general_forum_message_reports_topic_creation_failure(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            telegram.fail_create_forum_topic = True
+            codex = FakeCodex("finished")
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make me a session in kitia folder with gpt 5.5 high in yolo mode",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(codex.prompts, [])
+            self.assertEqual(store.load_topic_session("-1001:thread:50"), None)
+            self.assertIn("could not create a forum topic", telegram.messages[0][1])
+            self.assertEqual(telegram.messages[0][2], 9)
+
+    def test_general_forum_message_prefers_longest_model_match(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=PrefixModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make me a session in kitia folder with gpt 5.4 mini high in yolo mode",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.4-mini high | yolo")])
+            preference = store.load_model_preference("-1001:thread:50")
+            self.assertIsNotNone(preference)
+            assert preference is not None
+            self.assertEqual(preference.model, "gpt-5.4-mini")
+
+    def test_created_topic_uses_isolated_session_state_for_next_message(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kitia = root / "kitia"
+            kitia.mkdir()
+            other = root / "other"
+            other.mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex("finished")
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make me a session in kitia folder with gpt 5.5 high in yolo mode",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+            store.save_active_workspace("-1001", "other")
+            gateway.handle_message(
+                self._message(
+                    "work only in this topic",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                    message_thread_id=50,
+                )
+            )
+
+            self.assertEqual(codex.runs[-1], ("gpt-5.5", "high", kitia.resolve(), "yolo"))
+            self.assertIn("message_thread_id=50", codex.prompts[-1])
+            self.assertIn(f"workspace={kitia.resolve()}", codex.prompts[-1])
+            self.assertEqual(telegram.message_threads[-1], 50)
 
     def test_forum_topic_model_preference_is_separate_from_group_default(self):
         with TemporaryDirectory() as tmp:
