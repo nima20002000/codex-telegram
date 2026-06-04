@@ -28,6 +28,35 @@ Use Python 3.10+ with 4-space indentation, `from __future__ import annotations`,
 
 Tests use the standard `unittest` framework. Name files `tests/test_<module>.py` and test classes `<Feature>Tests`. Keep external systems mocked or isolated; tests should not call Telegram, run real Codex, or require a real `.env`. Add focused tests for config parsing, authorization, callback handling, session persistence, and command construction when changing those paths.
 
+## Manual Telegram E2E Testing
+
+Manual Telegram E2E checks are opt-in and use local-only ignored state. Do not
+commit the venv, Telegram session files, `.env`, `telegram-cred.md`, or anything
+under `.codex-telegram/`.
+
+The local admin MTProto session is stored at
+`.codex-telegram/e2e/admin-account.session`. If that file exists, reuse it; do
+not start a new Telegram login flow. A reusable setup is:
+
+```bash
+python3 -m venv /tmp/codex-telegram-e2e-venv
+/tmp/codex-telegram-e2e-venv/bin/python -m pip install --upgrade pip telethon
+mkdir -p .codex-telegram/e2e
+chmod 700 .codex-telegram .codex-telegram/e2e
+```
+
+Read `App api_id` and `App api_hash` from the ignored `telegram-cred.md`, then
+open Telethon with session path `.codex-telegram/e2e/admin-account`. Check
+authorization with `await client.is_user_authorized()` before doing anything
+else. If it returns `False`, stop and ask the user for the login code; do not
+guess or print sensitive values.
+
+For the current private forum-group E2E, verify the live bot first with Bot API
+`getMe` using the ignored installed `.env` token, then use the admin MTProto
+session to send a harmless marker message in the group and poll for the bot's
+reply. Keep messages explicitly non-mutating, for example: ask the bot to reply
+with a unique marker and not modify files.
+
 ## Commit & Pull Request Guidelines
 
 Recent commits use short imperative subjects, for example `Add Telegram model picker` and `Fix stale Codex model preferences`. Keep commits scoped to one behavior change and include tests or a clear reason tests were not run. Pull requests should describe the runtime impact, list validation commands, and mention any configuration or systemd changes. Include screenshots only for Telegram UI-visible command or button changes.
