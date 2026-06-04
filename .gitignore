@@ -1,4 +1,5 @@
 .env
+telegram-cred.md
 .venv/
 __pycache__/
 *.py[cod]
