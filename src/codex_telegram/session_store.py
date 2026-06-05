@@ -39,6 +39,16 @@ class TopicSession:
     goal_metadata: dict[str, object]
 
 
+@dataclass(frozen=True)
+class PendingTopicSessionProposal:
+    workspace: str
+    model: str
+    reasoning_effort: str
+    sandbox_mode: str
+    topic_name: str
+    created_at: int
+
+
 def _safe_chat_key(chat_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", chat_id).strip("_") or "chat"
 
@@ -55,9 +65,14 @@ class SessionStore:
         self._workspaces_path = state_dir / "workspaces.json"
         self._workspace_tokens_path = state_dir / "workspace_tokens.json"
         self._topic_sessions_path = state_dir / "topic_sessions.json"
+        self._pending_topic_sessions_path = state_dir / "pending_topic_sessions.json"
 
     def _path(self, chat_id: str) -> Path:
         return self._sessions_dir / f"{_safe_chat_key(chat_id)}.json"
+
+    @staticmethod
+    def _pending_topic_session_key(chat_id: str) -> str:
+        return hashlib.sha256(f"pending-topic-session:{chat_id}".encode("utf-8")).hexdigest()
 
     def load(self, chat_id: str) -> list[ChatTurn]:
         path = self._path(chat_id)
@@ -223,6 +238,78 @@ class SessionStore:
             return
         del workspaces[chat_id]
         self._save_string_map(self._workspaces_path, workspaces)
+
+    def _load_pending_topic_sessions(self) -> dict[str, dict[str, object]]:
+        if not self._pending_topic_sessions_path.exists():
+            return {}
+        raw = json.loads(self._pending_topic_sessions_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+        return {str(key): value for key, value in raw.items() if isinstance(value, dict)}
+
+    def _save_pending_topic_sessions(self, proposals: dict[str, dict[str, object]]) -> None:
+        self._pending_topic_sessions_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._pending_topic_sessions_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(proposals, indent=2), encoding="utf-8")
+        tmp.replace(self._pending_topic_sessions_path)
+
+    def save_pending_topic_session(
+        self,
+        chat_id: str,
+        *,
+        workspace: str,
+        model: str,
+        reasoning_effort: str,
+        sandbox_mode: str,
+        topic_name: str,
+        created_at: int | None = None,
+    ) -> None:
+        proposals = self._load_pending_topic_sessions()
+        proposals[self._pending_topic_session_key(chat_id)] = {
+            "workspace": workspace,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "sandbox_mode": sandbox_mode,
+            "topic_name": topic_name,
+            "created_at": int(time.time()) if created_at is None else created_at,
+        }
+        self._save_pending_topic_sessions(proposals)
+
+    def load_pending_topic_session(self, chat_id: str) -> PendingTopicSessionProposal | None:
+        raw = self._load_pending_topic_sessions().get(self._pending_topic_session_key(chat_id))
+        if raw is None:
+            return None
+        workspace = raw.get("workspace")
+        model = raw.get("model")
+        reasoning_effort = raw.get("reasoning_effort")
+        sandbox_mode = raw.get("sandbox_mode")
+        topic_name = raw.get("topic_name")
+        created_at = raw.get("created_at")
+        if not (
+            isinstance(workspace, str)
+            and isinstance(model, str)
+            and isinstance(reasoning_effort, str)
+            and isinstance(sandbox_mode, str)
+            and isinstance(topic_name, str)
+            and isinstance(created_at, int)
+        ):
+            return None
+        return PendingTopicSessionProposal(
+            workspace=workspace,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            sandbox_mode=sandbox_mode,
+            topic_name=topic_name,
+            created_at=created_at,
+        )
+
+    def clear_pending_topic_session(self, chat_id: str) -> bool:
+        proposals = self._load_pending_topic_sessions()
+        key = self._pending_topic_session_key(chat_id)
+        existed = key in proposals
+        proposals.pop(key, None)
+        self._save_pending_topic_sessions(proposals)
+        return existed
 
     def remember_workspace_token(self, relative_path: str) -> str:
         token = hashlib.sha256(relative_path.encode("utf-8")).hexdigest()[:16]

@@ -11,7 +11,7 @@ from pathlib import Path
 from .codex_runner import EMPTY_CODEX_RESPONSE, CodexRunner
 from .config import Settings
 from .model_catalog import CodexModelCatalog, ModelChoice
-from .session_store import ChatModelPreference, SessionStore, TopicSession
+from .session_store import ChatModelPreference, PendingTopicSessionProposal, SessionStore, TopicSession
 from .telegram_api import (
     IncomingCallback,
     IncomingMessage,
@@ -117,6 +117,7 @@ Action schemas:
 Rules:
 - General chat is a controller only. Do not perform coding work from General chat.
 - If the user asks to create a topic, session, or agent and gives enough settings, use create_topic_session.
+- If recent context plus the current message provide enough create-session settings, use create_topic_session.
 - Treat "topic", "session", and "agent" as equivalent creation language.
 - Correct obvious typos and casual wording when the intended workspace/settings are clear.
 - The root workspace can be represented as ".".
@@ -124,6 +125,7 @@ Rules:
 - Use recent General-chat context to understand follow-up questions.
 - Use only listed workspaces, models, sandbox modes, and the selected model's listed reasoning efforts.
 - The bridge validates that create-session settings are visible in the current user's message.
+- The bridge may ask the user to confirm a validated create-session proposal before creating a topic.
 - Destructive or administrative actions must match an explicit visible user request.
 - Never include secrets, tokens, private chat ids, or hidden local state.
 """
@@ -338,12 +340,23 @@ class CodexTelegramGateway:
         if not session_lines:
             session_lines.append("- none")
 
+        pending = self._sessions.load_pending_topic_session(message.chat_id)
+        if pending is None:
+            pending_text = "- none"
+        else:
+            pending_text = (
+                f"- workspace={pending.workspace or '.'} model={pending.model} "
+                f"thinking={pending.reasoning_effort} sandbox={pending.sandbox_mode} "
+                f"topic={pending.topic_name}"
+            )
+
         parts = [
             GENERAL_CONTROLLER_PROMPT.strip(),
             f"Root workspace name: {root.name}",
             "Available workspaces:\n" + "\n".join(workspace_lines),
             "Available models:\n" + "\n".join(model_lines),
             "Recorded topic sessions:\n" + "\n".join(session_lines),
+            "Pending create-session proposal:\n" + pending_text,
         ]
         history = self._sessions.render_recent(message.chat_id)
         if history:
@@ -368,6 +381,128 @@ class CodexTelegramGateway:
             sanitized_payload,
             ensure_ascii=False,
             sort_keys=True,
+        )
+
+    @staticmethod
+    def _pending_create_confirmation_visible(text: str) -> bool:
+        normalized = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+        return normalized in {
+            "yes",
+            "y",
+            "confirm",
+            "confirmed",
+            "create",
+            "create it",
+            "make it",
+            "do it",
+            "go ahead",
+            "please confirm",
+            "please create it",
+            "yes create it",
+            "yes please",
+            "ok",
+            "okay",
+            "sure",
+        }
+
+    @staticmethod
+    def _pending_create_cancel_visible(text: str) -> bool:
+        normalized = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+        return normalized in {
+            "cancel",
+            "cancel it",
+            "never mind",
+            "nevermind",
+            "discard",
+            "stop",
+            "no",
+            "no thanks",
+        }
+
+    def _recent_general_user_text(self, chat_id: str) -> str:
+        user_turns = [
+            turn.text
+            for turn in self._sessions.load(chat_id)[-self._settings.session_history_turns * 2 :]
+            if turn.role == "user"
+        ]
+        return "\n".join(user_turns)
+
+    def _general_create_context_text(self, message: IncomingMessage) -> str:
+        recent = self._recent_general_user_text(message.chat_id)
+        return "\n".join(part for part in (recent, message.text) if part)
+
+    def _recent_general_create_intent_present(self, chat_id: str) -> bool:
+        return any(
+            self._visible_action_allowed(turn.text, "create_topic_session")
+            for turn in self._sessions.load(chat_id)[-self._settings.session_history_turns * 2 :]
+            if turn.role == "user"
+        )
+
+    def _pending_create_summary(self, request: SessionProvisioningRequest) -> str:
+        workspace = request.workspace_relative or "."
+        return (
+            "I can create this topic session:\n"
+            f"Workspace: {workspace}\n"
+            f"Model: {request.model.slug}\n"
+            f"Thinking: {request.reasoning_effort}\n"
+            f"Sandbox: {request.sandbox_mode}\n"
+            f"Topic: {request.topic_name}\n\n"
+            "Reply `confirm` to create it, or `cancel` to discard it."
+        )
+
+    def _save_pending_create_request(
+        self,
+        message: IncomingMessage,
+        request: SessionProvisioningRequest,
+    ) -> GeneralControllerOutcome:
+        self._sessions.save_pending_topic_session(
+            message.chat_id,
+            workspace=request.workspace_relative,
+            model=request.model.slug,
+            reasoning_effort=request.reasoning_effort,
+            sandbox_mode=request.sandbox_mode,
+            topic_name=request.topic_name,
+        )
+        response = self._pending_create_summary(request)
+        self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+        return GeneralControllerOutcome(
+            True,
+            self._general_action_memory_text(
+                "propose_topic_session",
+                workspace=request.workspace_relative or ".",
+                model=request.model.slug,
+                reasoning_effort=request.reasoning_effort,
+                sandbox_mode=request.sandbox_mode,
+            ),
+        )
+
+    def _request_from_pending_proposal(
+        self,
+        proposal: PendingTopicSessionProposal,
+    ) -> tuple[SessionProvisioningRequest | None, str | None]:
+        workspace_path = self._workspace_path(proposal.workspace)
+        if workspace_path is None:
+            return None, "The pending workspace is no longer available."
+        model = self._model_catalog.get_model(proposal.model)
+        if model is None:
+            return None, "The pending model is no longer available."
+        if proposal.reasoning_effort not in model.reasoning_efforts:
+            return None, f"`{model.slug}` no longer supports `{proposal.reasoning_effort}` thinking."
+        if proposal.sandbox_mode not in {"constrained", "yolo"}:
+            return None, "The pending sandbox mode is no longer valid."
+        topic_name = proposal.topic_name.strip()[:128]
+        if not topic_name:
+            return None, "The pending topic name is no longer valid."
+        return (
+            SessionProvisioningRequest(
+                workspace_path=workspace_path,
+                workspace_relative=proposal.workspace,
+                model=model,
+                reasoning_effort=proposal.reasoning_effort,
+                sandbox_mode=proposal.sandbox_mode,
+                topic_name=topic_name,
+            ),
+            None,
         )
 
     @staticmethod
@@ -946,6 +1081,7 @@ class CodexTelegramGateway:
         )
         response = f"Created topic `{topic.name}` and configured the Codex session there."
         self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+        self._sessions.clear_pending_topic_session(message.chat_id)
         return GeneralControllerOutcome(
             True,
             self._general_action_memory_text(
@@ -956,6 +1092,26 @@ class CodexTelegramGateway:
                 sandbox_mode=request.sandbox_mode,
             ),
         )
+
+    def _handle_pending_create_confirmation(self, message: IncomingMessage) -> GeneralControllerOutcome:
+        proposal = self._sessions.load_pending_topic_session(message.chat_id)
+        if proposal is None:
+            response = "I do not have a pending session proposal. Tell me the workspace, model, thinking, and sandbox first."
+            self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+            return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+        request, error = self._request_from_pending_proposal(proposal)
+        if request is None:
+            self._sessions.clear_pending_topic_session(message.chat_id)
+            response = (error or "The pending session proposal is no longer valid.") + " Ask me to create it again."
+            self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+            return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+        return self._create_topic_session(message, request)
+
+    def _handle_pending_create_cancel(self, message: IncomingMessage) -> GeneralControllerOutcome:
+        existed = self._sessions.clear_pending_topic_session(message.chat_id)
+        response = "Canceled the pending session proposal." if existed else "I do not have a pending session proposal to cancel."
+        self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+        return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
 
     def _controller_create_request(self, action: dict[str, object]) -> tuple[SessionProvisioningRequest | None, str | None]:
         workspace_value = self._action_text(action, "workspace")
@@ -1010,7 +1166,11 @@ class CodexTelegramGateway:
     ) -> GeneralControllerOutcome:
         action_name = self._action_text(action, "action")
         if action_name == "create_topic_session":
-            if not self._visible_action_allowed(message.text, action_name):
+            create_intent_visible = self._visible_action_allowed(
+                message.text,
+                action_name,
+            ) or self._recent_general_create_intent_present(message.chat_id)
+            if not create_intent_visible:
                 response = (
                     "For safety, ask to create a topic/session/agent explicitly with the workspace, model, "
                     "thinking, and sandbox."
@@ -1024,10 +1184,12 @@ class CodexTelegramGateway:
                 return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
             missing = self._visible_create_settings_missing(message.text, request)
             if missing:
+                missing = self._visible_create_settings_missing(self._general_create_context_text(message), request)
+            if missing:
                 response = "I need the visible request to include: " + ", ".join(missing) + "."
                 self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
                 return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
-            return self._create_topic_session(message, request)
+            return self._save_pending_create_request(message, request)
 
         if action_name == "reply":
             response = self._telegram_response_text(
@@ -1109,6 +1271,16 @@ class CodexTelegramGateway:
         return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
 
     def _handle_general_forum_message(self, message: IncomingMessage) -> bool:
+        if self._pending_create_cancel_visible(message.text):
+            outcome = self._handle_pending_create_cancel(message)
+            self._sessions.append(message.chat_id, "user", sanitize_general_memory_text(message.text))
+            self._sessions.append(message.chat_id, "assistant", outcome.memory_text)
+            return outcome.handled
+        if self._pending_create_confirmation_visible(message.text):
+            outcome = self._handle_pending_create_confirmation(message)
+            self._sessions.append(message.chat_id, "user", sanitize_general_memory_text(message.text))
+            self._sessions.append(message.chat_id, "assistant", outcome.memory_text)
+            return outcome.handled
         action = self._run_general_controller(message)
         if action is None:
             response = "I could not understand the General-chat controller response. Try again with workspace, model, thinking, and sandbox."

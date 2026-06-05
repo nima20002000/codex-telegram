@@ -284,6 +284,9 @@ class GatewayTests(unittest.TestCase):
             payload["topic_name"] = topic_name
         return json.dumps(payload)
 
+    def _confirm_pending(self, gateway: CodexTelegramGateway, *, chat_id="-1001") -> None:
+        gateway.handle_message(self._message("confirm", chat_id=chat_id, chat_type="supergroup"))
+
     def test_help_command_does_not_run_codex(self):
         with TemporaryDirectory() as tmp:
             telegram = FakeTelegram()
@@ -1535,7 +1538,12 @@ class GatewayTests(unittest.TestCase):
             )
 
             topic_key = "-1001:thread:50"
+            self.assertEqual(telegram.created_topics, [])
+            self.assertIsNotNone(store.load_pending_topic_session("-1001"))
+            self.assertIn("Reply `confirm`", telegram.messages[0][1])
+            self._confirm_pending(gateway)
             self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
+            self.assertIsNone(store.load_pending_topic_session("-1001"))
             self.assertEqual(len(codex.prompts), 2)
             self.assertIn("General-chat controller", codex.prompts[0])
             self.assertIn("Current General-chat message:", codex.prompts[0])
@@ -1560,10 +1568,10 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(codex.extra_args[0], ("--skip-git-repo-check",))
             self.assertEqual(codex.runs[1], ("gpt-5.5", "high", kitia.resolve(), "read-only"))
             self.assertEqual(codex.extra_args[1], ())
-            self.assertIn("Topic agent ready", telegram.messages[0][1])
-            self.assertEqual(telegram.message_threads[0], 50)
-            self.assertIn("Created topic `kitia | gpt-5.5 high | yolo`", telegram.messages[1][1])
-            self.assertEqual(telegram.message_threads[1], None)
+            self.assertIn("Topic agent ready", telegram.messages[1][1])
+            self.assertEqual(telegram.message_threads[1], 50)
+            self.assertIn("Created topic `kitia | gpt-5.5 high | yolo`", telegram.messages[2][1])
+            self.assertEqual(telegram.message_threads[2], None)
 
     def test_topic_agent_intro_is_truncated_to_telegram_limit(self):
         with TemporaryDirectory() as tmp:
@@ -1593,10 +1601,11 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
+            self._confirm_pending(gateway)
 
-            self.assertLess(len(telegram.messages[0][1]), 13000)
-            self.assertIn("[Response truncated by MAX_TELEGRAM_RESPONSE_CHARS.]", telegram.messages[0][1])
-            self.assertEqual(store.load("-1001:thread:50")[0].text, telegram.messages[0][1])
+            self.assertLess(len(telegram.messages[1][1]), 13000)
+            self.assertIn("[Response truncated by MAX_TELEGRAM_RESPONSE_CHARS.]", telegram.messages[1][1])
+            self.assertEqual(store.load("-1001:thread:50")[0].text, telegram.messages[1][1])
 
     def test_topic_agent_fallback_intro_is_saved_to_history(self):
         with TemporaryDirectory() as tmp:
@@ -1625,13 +1634,14 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
+            self._confirm_pending(gateway)
 
             history = store.load("-1001:thread:50")
             self.assertEqual(len(history), 1)
             self.assertEqual(history[0].role, "assistant")
             self.assertIn("Session ready", history[0].text)
             self.assertIn("[Response truncated by MAX_TELEGRAM_RESPONSE_CHARS.]", history[0].text)
-            self.assertEqual(history[0].text, telegram.messages[0][1])
+            self.assertEqual(history[0].text, telegram.messages[1][1])
 
     def test_general_controller_ignores_controller_supplied_topic_title(self):
         with TemporaryDirectory() as tmp:
@@ -1660,6 +1670,7 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
+            self._confirm_pending(gateway)
 
             self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
 
@@ -1689,6 +1700,7 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
+            self._confirm_pending(gateway)
 
             self.assertEqual(telegram.created_topics, [("-1001", f"{root.name} | gpt-5.5 medium | yolo")])
             topic_session = store.load_topic_session("-1001:thread:50")
@@ -1798,6 +1810,7 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
+            self._confirm_pending(gateway)
 
             self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
 
@@ -1826,6 +1839,7 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
+            self._confirm_pending(gateway)
 
             self.assertEqual(telegram.created_topics, [("-1001", f"{root.name} | gpt-5.5 high | yolo")])
 
@@ -1857,6 +1871,7 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
+            self._confirm_pending(gateway)
 
             self.assertEqual(store.load_active_workspace("-1001:thread:50"), "desktop")
             self.assertEqual(codex.runs[1][2], desktop.resolve())
@@ -1889,6 +1904,7 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
+            self._confirm_pending(gateway)
 
             self.assertEqual(store.load_active_workspace("-1001:thread:50"), "desktop")
             self.assertEqual(codex.runs[1][2], desktop.resolve())
@@ -1953,6 +1969,7 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
+            self._confirm_pending(gateway)
 
             self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-tiny minimal | yolo")])
             self.assertIn("gpt-tiny: efforts=minimal, none", codex.prompts[0])
@@ -2144,6 +2161,7 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
+            self._confirm_pending(gateway)
 
             self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | constrained")])
 
@@ -2349,6 +2367,7 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
+            self._confirm_pending(gateway)
 
             self.assertIn("- prod/app", codex.prompts[0])
             self.assertEqual(store.load_active_workspace("-1001:thread:50"), "prod/app")
@@ -2386,6 +2405,7 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
+            self._confirm_pending(gateway)
 
             self.assertIn("- zzz-target", codex.prompts[0])
             self.assertEqual(store.load_active_workspace("-1001:thread:50"), "zzz-target")
@@ -2764,6 +2784,7 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
+            self._confirm_pending(gateway)
 
             gateway.handle_message(
                 self._message(
@@ -2854,6 +2875,7 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
+            self._confirm_pending(gateway)
 
             gateway.handle_message(
                 self._message("close topic kitia | gpt-5.5 high | yolo", chat_id="-1001", chat_type="supergroup")
@@ -2900,6 +2922,7 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
+            self._confirm_pending(gateway)
             store.append("-1001:thread:50", "user", "old topic state")
             store.save_topic_session(
                 chat_id="-1001",
@@ -3418,6 +3441,152 @@ class GatewayTests(unittest.TestCase):
                 ],
             )
 
+    def test_general_controller_creates_topic_after_multiturn_confirmation(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kitia = root / "kitia"
+            kitia.mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                [
+                    json.dumps({"action": "reply", "text": "Which workspace, model, thinking, and sandbox?"}),
+                    self._create_action("kitia", effort="high", sandbox="yolo"),
+                    "Topic agent ready.",
+                ]
+            )
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message("please create a new topic", chat_id="-1001", chat_type="supergroup")
+            )
+            gateway.handle_message(
+                self._message("kitia gpt 5.5 high yolo", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.created_topics, [])
+            pending = store.load_pending_topic_session("-1001")
+            self.assertIsNotNone(pending)
+            assert pending is not None
+            self.assertEqual(pending.workspace, "kitia")
+            pending_file = root / ".state" / "pending_topic_sessions.json"
+            pending_raw = pending_file.read_text(encoding="utf-8")
+            self.assertNotIn("-1001", pending_raw)
+            self.assertNotIn("chat_id", pending_raw)
+            self.assertIn("Recent General-chat controller context:", codex.prompts[1])
+            self.assertIn("User: please create a new topic", codex.prompts[1])
+            self.assertIn("Reply `confirm`", telegram.messages[-1][1])
+
+            self._confirm_pending(gateway)
+
+            self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
+            self.assertIsNone(store.load_pending_topic_session("-1001"))
+            self.assertEqual(store.load_active_workspace("-1001:thread:50"), "kitia")
+            self.assertEqual(codex.runs[-1], ("gpt-5.5", "high", kitia.resolve(), "read-only"))
+
+    def test_general_controller_confirmation_without_pending_proposal_does_not_run_codex(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            codex = FakeCodex("should not run")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+
+            self._confirm_pending(gateway)
+
+            self.assertEqual(telegram.created_topics, [])
+            self.assertEqual(codex.prompts, [])
+            self.assertIn("do not have a pending session proposal", telegram.messages[-1][1])
+
+    def test_general_controller_cancel_clears_pending_create_proposal(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(self._create_action("kitia", effort="high", sandbox="yolo"))
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in kitia with gpt 5.5 high yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+            gateway.handle_message(self._message("cancel", chat_id="-1001", chat_type="supergroup"))
+            self._confirm_pending(gateway)
+
+            self.assertIsNone(store.load_pending_topic_session("-1001"))
+            self.assertEqual(telegram.created_topics, [])
+            self.assertIn("Canceled the pending session proposal.", telegram.messages[1][1])
+            self.assertIn("do not have a pending session proposal", telegram.messages[2][1])
+
+    def test_general_controller_new_create_request_replaces_pending_proposal(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            salona = root / "salona"
+            salona.mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                [
+                    self._create_action("kitia", effort="high", sandbox="yolo"),
+                    self._create_action("salona", model="gpt-5.4-mini", effort="low", sandbox="constrained"),
+                    "Topic agent ready.",
+                ]
+            )
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make a new topic in kitia with gpt 5.5 high yolo",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+            gateway.handle_message(
+                self._message(
+                    "actually make an agent in salona with gpt 5.4 mini low constrained",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+            pending = store.load_pending_topic_session("-1001")
+            self.assertIsNotNone(pending)
+            assert pending is not None
+            self.assertEqual(pending.workspace, "salona")
+
+            self._confirm_pending(gateway)
+
+            self.assertEqual(telegram.created_topics, [("-1001", "salona | gpt-5.4-mini low | constrained")])
+            self.assertEqual(store.load_active_workspace("-1001:thread:50"), "salona")
+            self.assertEqual(codex.runs[-1], ("gpt-5.4-mini", "low", salona.resolve(), "read-only"))
+
     def test_general_controller_memory_redacts_local_paths_from_errors(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3600,11 +3769,12 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
+            self._confirm_pending(gateway)
 
             self.assertEqual(len(codex.prompts), 1)
             self.assertEqual(store.load_topic_session("-1001:thread:50"), None)
-            self.assertIn("could not create a forum topic", telegram.messages[0][1])
-            self.assertEqual(telegram.messages[0][2], 9)
+            self.assertIn("could not create a forum topic", telegram.messages[1][1])
+            self.assertEqual(telegram.messages[1][2], 9)
 
     def test_general_forum_message_prefers_longest_model_match(self):
         with TemporaryDirectory() as tmp:
@@ -3639,6 +3809,7 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
+            self._confirm_pending(gateway)
 
             self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.4-mini high | yolo")])
             preference = store.load_model_preference("-1001:thread:50")
@@ -3677,6 +3848,7 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
+            self._confirm_pending(gateway)
             store.save_active_workspace("-1001", "other")
             gateway.handle_message(
                 self._message(
@@ -3732,6 +3904,7 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
+            self._confirm_pending(gateway)
             gateway.handle_message(
                 self._message(
                     "make me an agent in salona folder with gpt 5.4 mini low in constrained mode",
@@ -3739,6 +3912,7 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
+            self._confirm_pending(gateway)
             gateway.handle_message(
                 self._message(
                     "kitia task",
@@ -3780,19 +3954,29 @@ class GatewayTests(unittest.TestCase):
             general_turns = store.load("-1001")
             self.assertEqual(
                 [turn.role for turn in general_turns],
-                ["user", "assistant", "user", "assistant"],
+                ["user", "assistant", "user", "assistant", "user", "assistant", "user", "assistant"],
             )
             self.assertEqual(
                 [turn.text for turn in general_turns if turn.role == "user"],
                 [
                     "make me a session in kitia folder with gpt 5.5 high in yolo mode",
+                    "confirm",
                     "make me an agent in salona folder with gpt 5.4 mini low in constrained mode",
+                    "confirm",
                 ],
             )
             self.assertTrue(general_turns[1].text.startswith("Controller action succeeded: "))
+            self.assertIn('"action": "propose_topic_session"', general_turns[1].text)
             self.assertIn('"workspace": "kitia"', general_turns[1].text)
             self.assertTrue(general_turns[3].text.startswith("Controller action succeeded: "))
-            self.assertIn('"workspace": "salona"', general_turns[3].text)
+            self.assertIn('"action": "create_topic_session"', general_turns[3].text)
+            self.assertIn('"workspace": "kitia"', general_turns[3].text)
+            self.assertTrue(general_turns[5].text.startswith("Controller action succeeded: "))
+            self.assertIn('"action": "propose_topic_session"', general_turns[5].text)
+            self.assertIn('"workspace": "salona"', general_turns[5].text)
+            self.assertTrue(general_turns[7].text.startswith("Controller action succeeded: "))
+            self.assertIn('"action": "create_topic_session"', general_turns[7].text)
+            self.assertIn('"workspace": "salona"', general_turns[7].text)
 
     def test_forum_topic_model_preference_is_separate_from_group_default(self):
         with TemporaryDirectory() as tmp:
