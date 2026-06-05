@@ -284,9 +284,6 @@ class GatewayTests(unittest.TestCase):
             payload["topic_name"] = topic_name
         return json.dumps(payload)
 
-    def _confirm_pending(self, gateway: CodexTelegramGateway, *, chat_id="-1001") -> None:
-        gateway.handle_message(self._message("confirm", chat_id=chat_id, chat_type="supergroup"))
-
     def test_help_command_does_not_run_codex(self):
         with TemporaryDirectory() as tmp:
             telegram = FakeTelegram()
@@ -1538,14 +1535,10 @@ class GatewayTests(unittest.TestCase):
             )
 
             topic_key = "-1001:thread:50"
-            self.assertEqual(telegram.created_topics, [])
-            self.assertIsNotNone(store.load_pending_topic_session("-1001"))
-            self.assertIn("Reply `confirm`", telegram.messages[0][1])
-            self._confirm_pending(gateway)
             self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
-            self.assertIsNone(store.load_pending_topic_session("-1001"))
             self.assertEqual(len(codex.prompts), 2)
             self.assertIn("General-chat controller", codex.prompts[0])
+            self.assertIn('"topic_name":"<optional topic title>"', codex.prompts[0])
             self.assertIn("Current General-chat message:", codex.prompts[0])
             self.assertIn("topic-scoped Codex agent", codex.prompts[1])
             self.assertEqual(store.load_active_workspace(topic_key), "kitia")
@@ -1568,10 +1561,10 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(codex.extra_args[0], ("--skip-git-repo-check",))
             self.assertEqual(codex.runs[1], ("gpt-5.5", "high", kitia.resolve(), "read-only"))
             self.assertEqual(codex.extra_args[1], ())
-            self.assertIn("Topic agent ready", telegram.messages[1][1])
-            self.assertEqual(telegram.message_threads[1], 50)
-            self.assertIn("Created topic `kitia | gpt-5.5 high | yolo`", telegram.messages[2][1])
-            self.assertEqual(telegram.message_threads[2], None)
+            self.assertIn("Topic agent ready", telegram.messages[0][1])
+            self.assertEqual(telegram.message_threads[0], 50)
+            self.assertIn("Created topic `kitia | gpt-5.5 high | yolo`", telegram.messages[1][1])
+            self.assertEqual(telegram.message_threads[1], None)
 
     def test_topic_agent_intro_is_truncated_to_telegram_limit(self):
         with TemporaryDirectory() as tmp:
@@ -1601,11 +1594,10 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
-            self._confirm_pending(gateway)
 
-            self.assertLess(len(telegram.messages[1][1]), 13000)
-            self.assertIn("[Response truncated by MAX_TELEGRAM_RESPONSE_CHARS.]", telegram.messages[1][1])
-            self.assertEqual(store.load("-1001:thread:50")[0].text, telegram.messages[1][1])
+            self.assertLess(len(telegram.messages[0][1]), 13000)
+            self.assertIn("[Response truncated by MAX_TELEGRAM_RESPONSE_CHARS.]", telegram.messages[0][1])
+            self.assertEqual(store.load("-1001:thread:50")[0].text, telegram.messages[0][1])
 
     def test_topic_agent_fallback_intro_is_saved_to_history(self):
         with TemporaryDirectory() as tmp:
@@ -1634,16 +1626,15 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
-            self._confirm_pending(gateway)
 
             history = store.load("-1001:thread:50")
             self.assertEqual(len(history), 1)
             self.assertEqual(history[0].role, "assistant")
             self.assertIn("Session ready", history[0].text)
             self.assertIn("[Response truncated by MAX_TELEGRAM_RESPONSE_CHARS.]", history[0].text)
-            self.assertEqual(history[0].text, telegram.messages[1][1])
+            self.assertEqual(history[0].text, telegram.messages[0][1])
 
-    def test_general_controller_ignores_controller_supplied_topic_title(self):
+    def test_general_controller_uses_controller_supplied_topic_title(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             kitia = root / "kitia"
@@ -1670,11 +1661,10 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
-            self._confirm_pending(gateway)
 
-            self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
+            self.assertEqual(telegram.created_topics, [("-1001", "Injected Title")])
 
-    def test_general_controller_accepts_root_workspace_typo_in_visible_request(self):
+    def test_general_controller_accepts_controller_root_workspace_typo_context(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
@@ -1700,9 +1690,8 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
-            self._confirm_pending(gateway)
 
-            self.assertEqual(telegram.created_topics, [("-1001", f"{root.name} | gpt-5.5 medium | yolo")])
+            self.assertEqual(telegram.created_topics, [("-1001", "desktop | gpt-5.5 medium | yolo")])
             topic_session = store.load_topic_session("-1001:thread:50")
             self.assertIsNotNone(topic_session)
             assert topic_session is not None
@@ -1710,7 +1699,7 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(topic_session.reasoning_effort, "medium")
             self.assertEqual(topic_session.sandbox_mode, "yolo")
 
-    def test_general_controller_rejects_root_workspace_alias_inside_path(self):
+    def test_general_controller_trusts_controller_root_workspace_from_context(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
@@ -1731,10 +1720,9 @@ class GatewayTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(telegram.created_topics, [])
-            self.assertIn("workspace", telegram.messages[-1][1])
+            self.assertEqual(telegram.created_topics, [("-1001", f"{root.name} | gpt-5.5 high | yolo")])
 
-    def test_general_controller_rejects_root_word_alias_inside_path(self):
+    def test_general_controller_trusts_controller_root_word_workspace_from_context(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
@@ -1755,10 +1743,9 @@ class GatewayTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(telegram.created_topics, [])
-            self.assertIn("workspace", telegram.messages[-1][1])
+            self.assertEqual(telegram.created_topics, [("-1001", f"{root.name} | gpt-5.5 high | yolo")])
 
-    def test_general_controller_rejects_hyphenated_root_alias_path(self):
+    def test_general_controller_trusts_controller_hyphenated_root_alias_context(self):
         for visible_workspace in ("root-kitia", "Desktop-kitia", "deaktop-kitia"):
             with self.subTest(visible_workspace=visible_workspace):
                 with TemporaryDirectory() as tmp:
@@ -1781,8 +1768,7 @@ class GatewayTests(unittest.TestCase):
                         )
                     )
 
-                    self.assertEqual(telegram.created_topics, [])
-                    self.assertIn("workspace", telegram.messages[-1][1])
+                    self.assertEqual(telegram.created_topics, [("-1001", f"{root.name} | gpt-5.5 high | yolo")])
 
     def test_general_controller_accepts_i_need_a_new_topic_create_intent(self):
         with TemporaryDirectory() as tmp:
@@ -1810,11 +1796,10 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
-            self._confirm_pending(gateway)
 
             self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
 
-    def test_general_controller_accepts_dot_root_workspace_in_visible_request(self):
+    def test_general_controller_accepts_controller_dot_root_workspace(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
@@ -1839,9 +1824,8 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
-            self._confirm_pending(gateway)
 
-            self.assertEqual(telegram.created_topics, [("-1001", f"{root.name} | gpt-5.5 high | yolo")])
+            self.assertEqual(telegram.created_topics, [("-1001", "root | gpt-5.5 high | yolo")])
 
     def test_general_controller_prefers_real_workspace_named_desktop_over_root_alias(self):
         with TemporaryDirectory() as tmp:
@@ -1871,7 +1855,6 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
-            self._confirm_pending(gateway)
 
             self.assertEqual(store.load_active_workspace("-1001:thread:50"), "desktop")
             self.assertEqual(codex.runs[1][2], desktop.resolve())
@@ -1904,12 +1887,11 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
-            self._confirm_pending(gateway)
 
             self.assertEqual(store.load_active_workspace("-1001:thread:50"), "desktop")
             self.assertEqual(codex.runs[1][2], desktop.resolve())
 
-    def test_general_controller_create_action_requires_visible_settings(self):
+    def test_general_controller_create_action_trusts_controller_settings(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "kitia").mkdir()
@@ -1931,13 +1913,9 @@ class GatewayTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(telegram.created_topics, [])
-            self.assertIn("workspace", telegram.messages[-1][1])
-            self.assertIn("model", telegram.messages[-1][1])
-            self.assertIn("thinking", telegram.messages[-1][1])
-            self.assertIn("sandbox", telegram.messages[-1][1])
+            self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
 
-    def test_general_controller_accepts_catalog_specific_visible_reasoning_effort(self):
+    def test_general_controller_accepts_catalog_specific_controller_reasoning_effort(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "kitia").mkdir()
@@ -1969,7 +1947,6 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
-            self._confirm_pending(gateway)
 
             self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-tiny minimal | yolo")])
             self.assertIn("gpt-tiny: efforts=minimal, none", codex.prompts[0])
@@ -1987,7 +1964,7 @@ class GatewayTests(unittest.TestCase):
             codex = FakeCodex(
                 self._create_action(
                     "kitia",
-                    model="gpt-5.4",
+                    model="gpt-5.4-unknown",
                     effort="high",
                     sandbox="yolo",
                     topic_name="kitia | gpt-5.4 high | yolo",
@@ -2012,7 +1989,7 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(telegram.created_topics, [])
             self.assertIn("model", telegram.messages[-1][1])
 
-    def test_general_controller_rejects_controller_model_substring_mismatch(self):
+    def test_general_controller_trusts_available_controller_model_from_context(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "kitia").mkdir()
@@ -2042,8 +2019,7 @@ class GatewayTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(telegram.created_topics, [])
-            self.assertIn("model", telegram.messages[-1][1])
+            self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.4-mini high | yolo")])
 
     def test_general_controller_rejects_controller_effort_substring_mismatch(self):
         with TemporaryDirectory() as tmp:
@@ -2053,7 +2029,7 @@ class GatewayTests(unittest.TestCase):
             codex = FakeCodex(
                 self._create_action(
                     "kitia",
-                    effort="high",
+                    effort="extreme",
                     sandbox="yolo",
                     topic_name="kitia | gpt-5.5 high | yolo",
                 )
@@ -2077,7 +2053,7 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(telegram.created_topics, [])
             self.assertIn("thinking", telegram.messages[-1][1])
 
-    def test_general_controller_rejects_split_xhigh_as_visible_high_for_model_without_xhigh(self):
+    def test_general_controller_rejects_controller_xhigh_for_model_without_xhigh(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "kitia").mkdir()
@@ -2086,7 +2062,7 @@ class GatewayTests(unittest.TestCase):
                 self._create_action(
                     "kitia",
                     model="gpt-5.4-mini",
-                    effort="high",
+                    effort="xhigh",
                     sandbox="yolo",
                     topic_name="kitia | gpt-5.4-mini high | yolo",
                 )
@@ -2110,7 +2086,7 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(telegram.created_topics, [])
             self.assertIn("thinking", telegram.messages[-1][1])
 
-    def test_general_controller_rejects_negated_yolo_for_yolo_sandbox(self):
+    def test_general_controller_trusts_controller_yolo_even_when_text_is_negated(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "kitia").mkdir()
@@ -2132,8 +2108,7 @@ class GatewayTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(telegram.created_topics, [])
-            self.assertIn("sandbox", telegram.messages[-1][1])
+            self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
 
     def test_general_controller_accepts_negated_yolo_as_constrained_sandbox(self):
         with TemporaryDirectory() as tmp:
@@ -2161,11 +2136,10 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
-            self._confirm_pending(gateway)
 
             self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | constrained")])
 
-    def test_general_controller_rejects_never_use_yolo_for_yolo_sandbox(self):
+    def test_general_controller_trusts_controller_yolo_from_never_use_text(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "kitia").mkdir()
@@ -2187,10 +2161,9 @@ class GatewayTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(telegram.created_topics, [])
-            self.assertIn("sandbox", telegram.messages[-1][1])
+            self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
 
-    def test_general_controller_rejects_avoid_bypass_for_yolo_sandbox(self):
+    def test_general_controller_trusts_controller_yolo_from_avoid_bypass_text(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "kitia").mkdir()
@@ -2212,10 +2185,9 @@ class GatewayTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(telegram.created_topics, [])
-            self.assertIn("sandbox", telegram.messages[-1][1])
+            self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
 
-    def test_general_controller_rejects_avoid_using_bypass_for_yolo_sandbox(self):
+    def test_general_controller_trusts_controller_yolo_from_avoid_using_bypass_text(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "kitia").mkdir()
@@ -2237,8 +2209,7 @@ class GatewayTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(telegram.created_topics, [])
-            self.assertIn("sandbox", telegram.messages[-1][1])
+            self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
 
     def test_non_forum_supergroup_message_uses_regular_codex_session(self):
         with TemporaryDirectory() as tmp:
@@ -2309,10 +2280,9 @@ class GatewayTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(telegram.created_topics, [])
-            self.assertIn("workspace", telegram.messages[-1][1])
+            self.assertEqual(telegram.created_topics, [("-1001", "root | gpt-5.5 high | constrained")])
 
-    def test_general_controller_nested_workspace_requires_visible_relative_path(self):
+    def test_general_controller_trusts_controller_nested_workspace_from_context(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "prod" / "app").mkdir(parents=True)
@@ -2336,10 +2306,9 @@ class GatewayTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(telegram.created_topics, [])
-            self.assertIn("workspace", telegram.messages[-1][1])
+            self.assertEqual(telegram.created_topics, [("-1001", "prod/app | gpt-5.5 high | yolo")])
 
-    def test_general_controller_lists_and_accepts_visible_nested_workspace(self):
+    def test_general_controller_lists_and_accepts_controller_nested_workspace(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             nested = root / "prod" / "app"
@@ -2367,7 +2336,6 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
-            self._confirm_pending(gateway)
 
             self.assertIn("- prod/app", codex.prompts[0])
             self.assertEqual(store.load_active_workspace("-1001:thread:50"), "prod/app")
@@ -2405,7 +2373,6 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
-            self._confirm_pending(gateway)
 
             self.assertIn("- zzz-target", codex.prompts[0])
             self.assertEqual(store.load_active_workspace("-1001:thread:50"), "zzz-target")
@@ -2448,7 +2415,7 @@ class GatewayTests(unittest.TestCase):
             self.assertNotIn("-1001", text)
             self.assertNotIn("thread", text.lower())
 
-    def test_general_controller_metadata_requires_visible_intent(self):
+    def test_general_controller_metadata_trusts_controller_action(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
@@ -2465,10 +2432,9 @@ class GatewayTests(unittest.TestCase):
                 self._message("hello there", chat_id="-1001", chat_type="supergroup")
             )
 
-            self.assertNotIn("Group metadata:", telegram.messages[-1][1])
-            self.assertIn("For safety", telegram.messages[-1][1])
+            self.assertIn("Group metadata:", telegram.messages[-1][1])
 
-    def test_general_controller_metadata_ignores_quoted_shortcut_text(self):
+    def test_general_controller_metadata_action_can_use_natural_context(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
@@ -2489,8 +2455,7 @@ class GatewayTests(unittest.TestCase):
                 )
             )
 
-            self.assertNotIn("Group metadata:", telegram.messages[-1][1])
-            self.assertIn("For safety", telegram.messages[-1][1])
+            self.assertIn("Group metadata:", telegram.messages[-1][1])
 
     def test_general_controller_preserves_metadata_shortcut_phrase(self):
         with TemporaryDirectory() as tmp:
@@ -2531,7 +2496,7 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(telegram.group_renames, [("-1001", "Temporary Dev Group")])
             self.assertIn("Renamed group to `Temporary Dev Group`.", telegram.messages[-1][1])
 
-    def test_general_forum_group_rename_uses_literal_visible_title(self):
+    def test_general_forum_group_rename_uses_controller_title(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
@@ -2548,10 +2513,10 @@ class GatewayTests(unittest.TestCase):
                 self._message("rename group to My Project", chat_id="-1001", chat_type="supergroup")
             )
 
-            self.assertEqual(telegram.group_renames, [("-1001", "My Project")])
-            self.assertIn("Renamed group to `My Project`.", telegram.messages[-1][1])
+            self.assertEqual(telegram.group_renames, [("-1001", "my project")])
+            self.assertIn("Renamed group to `my project`.", telegram.messages[-1][1])
 
-    def test_general_controller_group_rename_requires_visible_title(self):
+    def test_general_controller_group_rename_trusts_controller_title(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
@@ -2568,10 +2533,9 @@ class GatewayTests(unittest.TestCase):
                 self._message("rename group", chat_id="-1001", chat_type="supergroup")
             )
 
-            self.assertEqual(telegram.group_renames, [])
-            self.assertIn("group rename explicitly", telegram.messages[-1][1])
+            self.assertEqual(telegram.group_renames, [("-1001", "Hidden Title")])
 
-    def test_general_controller_group_rename_requires_exact_visible_title(self):
+    def test_general_controller_group_rename_uses_controller_title_over_message_title(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
@@ -2588,8 +2552,7 @@ class GatewayTests(unittest.TestCase):
                 self._message("rename group to Development", chat_id="-1001", chat_type="supergroup")
             )
 
-            self.assertEqual(telegram.group_renames, [])
-            self.assertIn("exact new group title", telegram.messages[-1][1])
+            self.assertEqual(telegram.group_renames, [("-1001", "Dev")])
 
     def test_general_controller_group_rename_accepts_unicode_title(self):
         with TemporaryDirectory() as tmp:
@@ -2611,7 +2574,7 @@ class GatewayTests(unittest.TestCase):
 
             self.assertEqual(telegram.group_renames, [("-1001", title)])
 
-    def test_general_controller_group_rename_rejects_partial_unicode_title(self):
+    def test_general_controller_group_rename_trusts_partial_unicode_controller_title(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
@@ -2628,10 +2591,9 @@ class GatewayTests(unittest.TestCase):
                 self._message("rename group to گروه تست", chat_id="-1001", chat_type="supergroup")
             )
 
-            self.assertEqual(telegram.group_renames, [])
-            self.assertIn("exact new group title", telegram.messages[-1][1])
+            self.assertEqual(telegram.group_renames, [("-1001", "گروه")])
 
-    def test_general_controller_group_rename_rejects_extra_controller_suffix(self):
+    def test_general_controller_group_rename_trusts_extra_controller_suffix(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
@@ -2648,8 +2610,7 @@ class GatewayTests(unittest.TestCase):
                 self._message("rename group to Dev", chat_id="-1001", chat_type="supergroup")
             )
 
-            self.assertEqual(telegram.group_renames, [])
-            self.assertIn("exact new group title", telegram.messages[-1][1])
+            self.assertEqual(telegram.group_renames, [("-1001", "Dev 🚨")])
 
     def test_general_controller_accepts_explicit_admin_phrasing_with_articles(self):
         with TemporaryDirectory() as tmp:
@@ -2784,7 +2745,6 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
-            self._confirm_pending(gateway)
 
             gateway.handle_message(
                 self._message(
@@ -2794,6 +2754,7 @@ class GatewayTests(unittest.TestCase):
                 )
             )
 
+            self.assertIn("- #50 kitia | gpt-5.5 high | yolo [open]", codex.prompts[2])
             self.assertEqual(telegram.edited_forum_topics, [("-1001", 50, "kitia renamed")])
             topic_session = store.load_topic_session("-1001:thread:50")
             self.assertIsNotNone(topic_session)
@@ -2801,7 +2762,7 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(topic_session.topic_name, "kitia renamed")
             self.assertIn("Renamed topic", telegram.messages[-1][1])
 
-    def test_general_forum_topic_rename_uses_literal_visible_new_name(self):
+    def test_general_forum_topic_rename_uses_controller_new_name(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
@@ -2841,11 +2802,11 @@ class GatewayTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(telegram.edited_forum_topics, [("-1001", 50, "Kitia Renamed")])
+            self.assertEqual(telegram.edited_forum_topics, [("-1001", 50, "kitia renamed")])
             topic_session = store.load_topic_session("-1001:thread:50")
             self.assertIsNotNone(topic_session)
             assert topic_session is not None
-            self.assertEqual(topic_session.topic_name, "Kitia Renamed")
+            self.assertEqual(topic_session.topic_name, "kitia renamed")
 
     def test_general_forum_message_closes_and_reopens_topic_session(self):
         with TemporaryDirectory() as tmp:
@@ -2875,7 +2836,6 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
-            self._confirm_pending(gateway)
 
             gateway.handle_message(
                 self._message("close topic kitia | gpt-5.5 high | yolo", chat_id="-1001", chat_type="supergroup")
@@ -2922,7 +2882,6 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
-            self._confirm_pending(gateway)
             store.append("-1001:thread:50", "user", "old topic state")
             store.save_topic_session(
                 chat_id="-1001",
@@ -2979,9 +2938,9 @@ class GatewayTests(unittest.TestCase):
             )
 
             self.assertEqual(telegram.closed_forum_topics, [])
-            self.assertIn("exact recorded topic", telegram.messages[-1][1])
+            self.assertIn("ambiguous", telegram.messages[-1][1])
 
-    def test_general_forum_lifecycle_rejects_unique_partial_topic_target(self):
+    def test_general_forum_lifecycle_accepts_unique_partial_topic_target(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
@@ -3009,11 +2968,10 @@ class GatewayTests(unittest.TestCase):
                 self._message("delete topic kitia", chat_id="-1001", chat_type="supergroup")
             )
 
-            self.assertEqual(telegram.deleted_forum_topics, [])
-            self.assertIsNotNone(store.load_topic_session("-1001:thread:50"))
-            self.assertIn("exact recorded topic", telegram.messages[-1][1])
+            self.assertEqual(telegram.deleted_forum_topics, [("-1001", 50)])
+            self.assertIsNone(store.load_topic_session("-1001:thread:50"))
 
-    def test_general_forum_lifecycle_rejects_normalized_topic_title_target(self):
+    def test_general_forum_lifecycle_accepts_normalized_topic_title_target(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
@@ -3041,9 +2999,8 @@ class GatewayTests(unittest.TestCase):
                 self._message("delete topic kitiagpt55highyolo", chat_id="-1001", chat_type="supergroup")
             )
 
-            self.assertEqual(telegram.deleted_forum_topics, [])
-            self.assertIsNotNone(store.load_topic_session("-1001:thread:50"))
-            self.assertIn("exact recorded topic", telegram.messages[-1][1])
+            self.assertEqual(telegram.deleted_forum_topics, [("-1001", 50)])
+            self.assertIsNone(store.load_topic_session("-1001:thread:50"))
 
     def test_general_forum_lifecycle_accepts_exact_numeric_topic_title(self):
         with TemporaryDirectory() as tmp:
@@ -3101,7 +3058,7 @@ class GatewayTests(unittest.TestCase):
                 reasoning_effort="high",
                 sandbox_mode="constrained",
             )
-            codex = FakeCodex(json.dumps({"action": "delete_topic", "target": "50"}))
+            codex = FakeCodex(json.dumps({"action": "delete_topic", "target": "#50"}))
             gateway = CodexTelegramGateway(
                 settings=self._settings(root),
                 telegram=telegram,
@@ -3117,6 +3074,80 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(telegram.deleted_forum_topics, [("-1001", 50)])
             self.assertIsNotNone(store.load_topic_session("-1001:thread:7"))
             self.assertIsNone(store.load_topic_session("-1001:thread:50"))
+
+    def test_general_forum_lifecycle_prefers_bare_thread_id_over_numeric_title(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key="-1001:thread:7",
+                topic_name="50",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=50,
+                session_key="-1001:thread:50",
+                topic_name="other",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            codex = FakeCodex(json.dumps({"action": "delete_topic", "target": "50"}))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message("delete topic 50", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.deleted_forum_topics, [("-1001", 50)])
+            self.assertIsNotNone(store.load_topic_session("-1001:thread:7"))
+            self.assertIsNone(store.load_topic_session("-1001:thread:50"))
+
+    def test_general_forum_lifecycle_rejects_numeric_partial_title_target(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            store.save_topic_session(
+                chat_id="-1001",
+                message_thread_id=7,
+                session_key="-1001:thread:7",
+                topic_name="release 50",
+                workspace="",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                sandbox_mode="constrained",
+            )
+            codex = FakeCodex(json.dumps({"action": "delete_topic", "target": "50"}))
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message("delete topic 50", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.deleted_forum_topics, [])
+            self.assertIsNotNone(store.load_topic_session("-1001:thread:7"))
+            self.assertIn("thread id `50` or exact title `50`", telegram.messages[-1][1])
 
     def test_general_forum_lifecycle_rejects_all_topics_target(self):
         with TemporaryDirectory() as tmp:
@@ -3185,7 +3216,7 @@ class GatewayTests(unittest.TestCase):
             self.assertFalse(session.is_closed)
             self.assertIn("could not close topic", telegram.messages[-1][1])
 
-    def test_general_controller_destructive_action_requires_visible_intent(self):
+    def test_general_controller_destructive_action_trusts_controller_intent(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
@@ -3217,11 +3248,10 @@ class GatewayTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(telegram.deleted_forum_topics, [])
-            self.assertIsNotNone(store.load_topic_session("-1001:thread:50"))
-            self.assertIn("For safety", telegram.messages[-1][1])
+            self.assertEqual(telegram.deleted_forum_topics, [("-1001", 50)])
+            self.assertIsNone(store.load_topic_session("-1001:thread:50"))
 
-    def test_general_controller_destructive_action_requires_visible_target(self):
+    def test_general_controller_destructive_action_trusts_controller_target(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
@@ -3253,11 +3283,10 @@ class GatewayTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(telegram.deleted_forum_topics, [])
-            self.assertIsNotNone(store.load_topic_session("-1001:thread:50"))
-            self.assertIn("exact topic name", telegram.messages[-1][1])
+            self.assertEqual(telegram.deleted_forum_topics, [("-1001", 50)])
+            self.assertIsNone(store.load_topic_session("-1001:thread:50"))
 
-    def test_general_controller_destructive_action_ignores_quoted_command_text(self):
+    def test_general_controller_destructive_action_trusts_controller_for_quoted_text(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
@@ -3289,11 +3318,10 @@ class GatewayTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(telegram.deleted_forum_topics, [])
-            self.assertIsNotNone(store.load_topic_session("-1001:thread:50"))
-            self.assertIn("topic admin action explicitly", telegram.messages[-1][1])
+            self.assertEqual(telegram.deleted_forum_topics, [("-1001", 50)])
+            self.assertIsNone(store.load_topic_session("-1001:thread:50"))
 
-    def test_general_controller_destructive_action_requires_exact_visible_target(self):
+    def test_general_controller_destructive_action_trusts_exact_controller_target(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
@@ -3325,11 +3353,10 @@ class GatewayTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(telegram.deleted_forum_topics, [])
-            self.assertIsNotNone(store.load_topic_session("-1001:thread:50"))
-            self.assertIn("exact topic name", telegram.messages[-1][1])
+            self.assertEqual(telegram.deleted_forum_topics, [("-1001", 50)])
+            self.assertIsNone(store.load_topic_session("-1001:thread:50"))
 
-    def test_general_controller_create_action_requires_visible_intent(self):
+    def test_general_controller_create_action_trusts_controller_intent(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "kitia").mkdir()
@@ -3351,10 +3378,9 @@ class GatewayTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(telegram.created_topics, [])
-            self.assertIn("For safety", telegram.messages[-1][1])
+            self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
 
-    def test_general_controller_create_action_ignores_quoted_command_text(self):
+    def test_general_controller_create_action_trusts_controller_for_quoted_text(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "kitia").mkdir()
@@ -3376,10 +3402,9 @@ class GatewayTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(telegram.created_topics, [])
-            self.assertIn("For safety", telegram.messages[-1][1])
+            self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
 
-    def test_general_controller_create_action_rejects_summary_of_pasted_create_command(self):
+    def test_general_controller_create_action_trusts_controller_for_summary_text(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "kitia").mkdir()
@@ -3406,10 +3431,9 @@ class GatewayTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(telegram.created_topics, [])
-            self.assertIn("For safety", telegram.messages[-1][1])
+            self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
 
-    def test_rejected_general_create_action_stores_safety_reply_memory(self):
+    def test_general_create_action_stores_success_memory(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "kitia").mkdir()
@@ -3428,20 +3452,20 @@ class GatewayTests(unittest.TestCase):
                 self._message("kitia gpt 5.5 high yolo", chat_id="-1001", chat_type="supergroup")
             )
 
-            self.assertEqual(telegram.created_topics, [])
-            self.assertIn("For safety", telegram.messages[-1][1])
+            self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
             self.assertEqual(
                 [turn.text for turn in store.load("-1001")],
                 [
                     "kitia gpt 5.5 high yolo",
                     (
-                        "Controller reply: For safety, ask to create a topic/session/agent explicitly "
-                        "with the workspace, model, thinking, and sandbox."
+                        'Controller action succeeded: {"action": "create_topic_session", '
+                        '"model": "gpt-5.5", "reasoning_effort": "high", '
+                        '"sandbox_mode": "yolo", "workspace": "kitia"}'
                     ),
                 ],
             )
 
-    def test_general_controller_creates_topic_after_multiturn_confirmation(self):
+    def test_general_controller_creates_topic_from_multiturn_context_without_confirmation(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             kitia = root / "kitia"
@@ -3470,27 +3494,13 @@ class GatewayTests(unittest.TestCase):
                 self._message("kitia gpt 5.5 high yolo", chat_id="-1001", chat_type="supergroup")
             )
 
-            self.assertEqual(telegram.created_topics, [])
-            pending = store.load_pending_topic_session("-1001")
-            self.assertIsNotNone(pending)
-            assert pending is not None
-            self.assertEqual(pending.workspace, "kitia")
-            pending_file = root / ".state" / "pending_topic_sessions.json"
-            pending_raw = pending_file.read_text(encoding="utf-8")
-            self.assertNotIn("-1001", pending_raw)
-            self.assertNotIn("chat_id", pending_raw)
+            self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
             self.assertIn("Recent General-chat controller context:", codex.prompts[1])
             self.assertIn("User: please create a new topic", codex.prompts[1])
-            self.assertIn("Reply `confirm`", telegram.messages[-1][1])
-
-            self._confirm_pending(gateway)
-
-            self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
-            self.assertIsNone(store.load_pending_topic_session("-1001"))
             self.assertEqual(store.load_active_workspace("-1001:thread:50"), "kitia")
             self.assertEqual(codex.runs[-1], ("gpt-5.5", "high", kitia.resolve(), "read-only"))
 
-    def test_general_controller_confirmation_without_pending_proposal_does_not_run_codex(self):
+    def test_general_controller_confirm_is_ordinary_general_text(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             telegram = FakeTelegram()
@@ -3503,18 +3513,24 @@ class GatewayTests(unittest.TestCase):
                 sessions=SessionStore(root / ".state"),
             )
 
-            self._confirm_pending(gateway)
+            gateway.handle_message(self._message("confirm", chat_id="-1001", chat_type="supergroup"))
 
             self.assertEqual(telegram.created_topics, [])
-            self.assertEqual(codex.prompts, [])
-            self.assertIn("do not have a pending session proposal", telegram.messages[-1][1])
+            self.assertEqual(len(codex.prompts), 1)
+            self.assertIn("could not understand", telegram.messages[-1][1])
 
-    def test_general_controller_cancel_clears_pending_create_proposal(self):
+    def test_general_controller_cancel_is_ordinary_general_text_after_direct_create(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "kitia").mkdir()
             telegram = FakeTelegram()
-            codex = FakeCodex(self._create_action("kitia", effort="high", sandbox="yolo"))
+            codex = FakeCodex(
+                [
+                    self._create_action("kitia", effort="high", sandbox="yolo"),
+                    "Topic agent ready.",
+                    json.dumps({"action": "reply", "text": "No pending proposal exists."}),
+                ]
+            )
             store = SessionStore(root / ".state")
             gateway = CodexTelegramGateway(
                 settings=self._settings(root),
@@ -3532,14 +3548,11 @@ class GatewayTests(unittest.TestCase):
                 )
             )
             gateway.handle_message(self._message("cancel", chat_id="-1001", chat_type="supergroup"))
-            self._confirm_pending(gateway)
 
-            self.assertIsNone(store.load_pending_topic_session("-1001"))
-            self.assertEqual(telegram.created_topics, [])
-            self.assertIn("Canceled the pending session proposal.", telegram.messages[1][1])
-            self.assertIn("do not have a pending session proposal", telegram.messages[2][1])
+            self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.5 high | yolo")])
+            self.assertIn("No pending proposal exists.", telegram.messages[-1][1])
 
-    def test_general_controller_new_create_request_replaces_pending_proposal(self):
+    def test_general_controller_new_create_request_creates_another_topic_without_pending_state(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "kitia").mkdir()
@@ -3549,6 +3562,7 @@ class GatewayTests(unittest.TestCase):
             codex = FakeCodex(
                 [
                     self._create_action("kitia", effort="high", sandbox="yolo"),
+                    "Topic agent ready.",
                     self._create_action("salona", model="gpt-5.4-mini", effort="low", sandbox="constrained"),
                     "Topic agent ready.",
                 ]
@@ -3576,15 +3590,14 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
-            pending = store.load_pending_topic_session("-1001")
-            self.assertIsNotNone(pending)
-            assert pending is not None
-            self.assertEqual(pending.workspace, "salona")
-
-            self._confirm_pending(gateway)
-
-            self.assertEqual(telegram.created_topics, [("-1001", "salona | gpt-5.4-mini low | constrained")])
-            self.assertEqual(store.load_active_workspace("-1001:thread:50"), "salona")
+            self.assertEqual(
+                telegram.created_topics,
+                [
+                    ("-1001", "kitia | gpt-5.5 high | yolo"),
+                    ("-1001", "salona | gpt-5.4-mini low | constrained"),
+                ],
+            )
+            self.assertEqual(store.load_active_workspace("-1001:thread:51"), "salona")
             self.assertEqual(codex.runs[-1], ("gpt-5.4-mini", "low", salona.resolve(), "read-only"))
 
     def test_general_controller_memory_redacts_local_paths_from_errors(self):
@@ -3769,12 +3782,11 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
-            self._confirm_pending(gateway)
 
             self.assertEqual(len(codex.prompts), 1)
             self.assertEqual(store.load_topic_session("-1001:thread:50"), None)
-            self.assertIn("could not create a forum topic", telegram.messages[1][1])
-            self.assertEqual(telegram.messages[1][2], 9)
+            self.assertIn("could not create a forum topic", telegram.messages[0][1])
+            self.assertEqual(telegram.messages[0][2], 9)
 
     def test_general_forum_message_prefers_longest_model_match(self):
         with TemporaryDirectory() as tmp:
@@ -3809,7 +3821,6 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
-            self._confirm_pending(gateway)
 
             self.assertEqual(telegram.created_topics, [("-1001", "kitia | gpt-5.4-mini high | yolo")])
             preference = store.load_model_preference("-1001:thread:50")
@@ -3848,7 +3859,6 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
-            self._confirm_pending(gateway)
             store.save_active_workspace("-1001", "other")
             gateway.handle_message(
                 self._message(
@@ -3904,7 +3914,6 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
-            self._confirm_pending(gateway)
             gateway.handle_message(
                 self._message(
                     "make me an agent in salona folder with gpt 5.4 mini low in constrained mode",
@@ -3912,7 +3921,6 @@ class GatewayTests(unittest.TestCase):
                     chat_type="supergroup",
                 )
             )
-            self._confirm_pending(gateway)
             gateway.handle_message(
                 self._message(
                     "kitia task",
@@ -3954,29 +3962,21 @@ class GatewayTests(unittest.TestCase):
             general_turns = store.load("-1001")
             self.assertEqual(
                 [turn.role for turn in general_turns],
-                ["user", "assistant", "user", "assistant", "user", "assistant", "user", "assistant"],
+                ["user", "assistant", "user", "assistant"],
             )
             self.assertEqual(
                 [turn.text for turn in general_turns if turn.role == "user"],
                 [
                     "make me a session in kitia folder with gpt 5.5 high in yolo mode",
-                    "confirm",
                     "make me an agent in salona folder with gpt 5.4 mini low in constrained mode",
-                    "confirm",
                 ],
             )
             self.assertTrue(general_turns[1].text.startswith("Controller action succeeded: "))
-            self.assertIn('"action": "propose_topic_session"', general_turns[1].text)
+            self.assertIn('"action": "create_topic_session"', general_turns[1].text)
             self.assertIn('"workspace": "kitia"', general_turns[1].text)
             self.assertTrue(general_turns[3].text.startswith("Controller action succeeded: "))
             self.assertIn('"action": "create_topic_session"', general_turns[3].text)
-            self.assertIn('"workspace": "kitia"', general_turns[3].text)
-            self.assertTrue(general_turns[5].text.startswith("Controller action succeeded: "))
-            self.assertIn('"action": "propose_topic_session"', general_turns[5].text)
-            self.assertIn('"workspace": "salona"', general_turns[5].text)
-            self.assertTrue(general_turns[7].text.startswith("Controller action succeeded: "))
-            self.assertIn('"action": "create_topic_session"', general_turns[7].text)
-            self.assertIn('"workspace": "salona"', general_turns[7].text)
+            self.assertIn('"workspace": "salona"', general_turns[3].text)
 
     def test_forum_topic_model_preference_is_separate_from_group_default(self):
         with TemporaryDirectory() as tmp:
