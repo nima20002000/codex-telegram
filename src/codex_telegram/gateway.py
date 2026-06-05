@@ -91,10 +91,12 @@ class TopicLifecycleRequest:
 class GeneralControllerOutcome:
     handled: bool
     memory_text: str
+    success: bool = True
+    summary: str = ""
 
 
 GENERAL_CONTROLLER_PROMPT = """You are the trusted General-chat controller and operator for a private Telegram forum group.
-Your job is to understand the user's natural-language request and choose one Telegram bridge action.
+Your job is to understand the user's natural-language request and choose one or more Telegram bridge actions.
 Return only one JSON object. Do not include Markdown, prose, or code fences.
 
 Available actions:
@@ -105,6 +107,11 @@ Available actions:
 - reply: ask for missing information or answer a General-chat management question.
 
 Action schemas:
+Preferred multi-action response:
+{"actions":[{"action":"create_topic_session","workspace":"<relative workspace or .>","model":"<model slug>","reasoning_effort":"<one listed effort for the selected model>","sandbox_mode":"constrained|yolo","topic_name":"<optional topic title>"}]}
+Put one action object in the actions array for each requested operation.
+
+Backward-compatible single-action responses:
 {"action":"create_topic_session","workspace":"<relative workspace or .>","model":"<model slug>","reasoning_effort":"<one listed effort for the selected model>","sandbox_mode":"constrained|yolo","topic_name":"<optional topic title>"}
 {"action":"rename_topic","target":"<topic name or thread id>","new_name":"<new topic name>"}
 {"action":"close_topic","target":"<topic name or thread id>"}
@@ -117,6 +124,8 @@ Action schemas:
 Rules:
 - General chat is a trusted group operator. It may manage this private group and topic sessions directly.
 - General chat is not the place for coding work. Create or select a topic-scoped agent for coding tasks.
+- If the user asks for multiple topic/session/group changes, return all required actions in an actions array in the order they should run.
+- You may create, rename, close, reopen, or delete multiple topics from one request.
 - If the user asks to create a topic, session, or agent and the conversation gives enough settings, use create_topic_session.
 - Treat "topic", "session", and "agent" as equivalent creation language.
 - Correct obvious typos and casual wording when the intended workspace/settings are clear.
@@ -374,6 +383,19 @@ class CodexTelegramGateway:
             sort_keys=True,
         )
 
+    def _general_batch_memory_text(self, outcomes: list[GeneralControllerOutcome]) -> str:
+        items = []
+        for index, outcome in enumerate(outcomes, start=1):
+            items.append(
+                {
+                    "index": str(index),
+                    "success": "yes" if outcome.success else "no",
+                    "summary": sanitize_general_memory_text(outcome.summary or outcome.memory_text),
+                    "memory": sanitize_general_memory_text(outcome.memory_text),
+                }
+            )
+        return "Controller batch result: " + json.dumps(items, ensure_ascii=False, sort_keys=True)
+
     @staticmethod
     def _extract_json_object(text: str) -> dict[str, object] | None:
         stripped = text.strip()
@@ -409,6 +431,16 @@ class CodexTelegramGateway:
         return self._extract_json_object(result.text)
 
     @staticmethod
+    def _controller_actions(payload: dict[str, object]) -> list[dict[str, object]] | None:
+        actions = payload.get("actions")
+        if isinstance(actions, list):
+            out = [item for item in actions if isinstance(item, dict)]
+            return out or None
+        if isinstance(payload.get("action"), str):
+            return [payload]
+        return None
+
+    @staticmethod
     def _action_text(action: dict[str, object], key: str) -> str | None:
         value = action.get(key)
         if not isinstance(value, str):
@@ -435,30 +467,50 @@ class CodexTelegramGateway:
         self._chat_is_forum_cache[message.chat_id] = is_forum
         return is_forum
 
-    def _handle_group_rename_request(self, message: IncomingMessage, title: str) -> GeneralControllerOutcome:
+    def _handle_group_rename_request(
+        self,
+        message: IncomingMessage,
+        title: str,
+        *,
+        notify_general: bool = True,
+    ) -> GeneralControllerOutcome:
         if not 1 <= len(title) <= 128:
             response = "Group titles must be 1 to 128 characters."
-            self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
-            return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+            if notify_general:
+                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+            return GeneralControllerOutcome(True, self._general_reply_memory_text(response), False, response)
         try:
             self._telegram.set_chat_title(message.chat_id, title)
         except TelegramAPIError:
             logger.warning("Failed to rename Telegram group chat=%s", message.chat_id, exc_info=True)
             response = "I could not rename the group. Check the bot's group admin permissions."
-            self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
-            return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+            if notify_general:
+                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+            return GeneralControllerOutcome(True, self._general_reply_memory_text(response), False, response)
         response = f"Renamed group to `{title}`."
-        self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
-        return GeneralControllerOutcome(True, self._general_action_memory_text("rename_group", title=title))
+        if notify_general:
+            self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+        return GeneralControllerOutcome(
+            True,
+            self._general_action_memory_text("rename_group", title=title),
+            True,
+            response,
+        )
 
-    def _handle_metadata_report_request(self, message: IncomingMessage) -> GeneralControllerOutcome:
+    def _handle_metadata_report_request(
+        self,
+        message: IncomingMessage,
+        *,
+        notify_general: bool = True,
+    ) -> GeneralControllerOutcome:
         try:
             chat = self._telegram.get_chat(message.chat_id)
         except TelegramAPIError:
             logger.warning("Failed to fetch Telegram group metadata chat=%s", message.chat_id, exc_info=True)
             response = "I could not read the group metadata. Check the bot's group admin permissions."
-            self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
-            return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+            if notify_general:
+                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+            return GeneralControllerOutcome(True, self._general_reply_memory_text(response), False, response)
 
         forum = "yes" if chat.is_forum else "no"
         lines = [
@@ -480,12 +532,19 @@ class CodexTelegramGateway:
                 f"fast={'on' if session.fast_mode else 'off'} "
                 f"goal={goal if isinstance(goal, str) else 'none'}"
             )
-        self._telegram.send_message(
-            message.chat_id,
-            "\n".join(lines),
-            reply_to_message_id=message.message_id,
+        response = "\n".join(lines)
+        if notify_general:
+            self._telegram.send_message(
+                message.chat_id,
+                response,
+                reply_to_message_id=message.message_id,
+            )
+        return GeneralControllerOutcome(
+            True,
+            self._general_action_memory_text("report_metadata"),
+            True,
+            "Read group metadata.",
         )
-        return GeneralControllerOutcome(True, self._general_action_memory_text("report_metadata"))
 
     @staticmethod
     def _clean_topic_phrase(value: str) -> str:
@@ -558,24 +617,27 @@ class CodexTelegramGateway:
         request: TopicLifecycleRequest,
         *,
         exact_target: bool = False,
+        notify_general: bool = True,
     ) -> GeneralControllerOutcome:
         session, error = self._resolve_topic_session(message.chat_id, request.target, allow_partial=not exact_target)
         if session is None:
             response = error or "I could not find that topic session."
-            self._telegram.send_message(
-                message.chat_id,
-                response,
-                reply_to_message_id=message.message_id,
-            )
-            return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+            if notify_general:
+                self._telegram.send_message(
+                    message.chat_id,
+                    response,
+                    reply_to_message_id=message.message_id,
+                )
+            return GeneralControllerOutcome(True, self._general_reply_memory_text(response), False, response)
 
         try:
             if request.action == "rename":
                 new_name = self._clean_topic_phrase(request.new_name or "")
                 if not 1 <= len(new_name) <= 128:
                     response = "Topic names must be 1 to 128 characters."
-                    self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
-                    return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+                    if notify_general:
+                        self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                    return GeneralControllerOutcome(True, self._general_reply_memory_text(response), False, response)
                 self._telegram.edit_forum_topic(
                     message.chat_id,
                     session.message_thread_id,
@@ -583,30 +645,39 @@ class CodexTelegramGateway:
                 )
                 self._sessions.update_topic_session_name(session.session_key, new_name)
                 response = f"Renamed topic `{session.topic_name}` to `{new_name}`."
-                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                if notify_general:
+                    self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
                 return GeneralControllerOutcome(
                     True,
                     self._general_action_memory_text("rename_topic", target=session.topic_name, new_name=new_name),
+                    True,
+                    response,
                 )
 
             if request.action == "close":
                 self._telegram.close_forum_topic(message.chat_id, session.message_thread_id)
                 self._sessions.set_topic_session_closed(session.session_key, True)
                 response = f"Closed topic `{session.topic_name}` and marked its session closed."
-                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                if notify_general:
+                    self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
                 return GeneralControllerOutcome(
                     True,
                     self._general_action_memory_text("close_topic", target=session.topic_name),
+                    True,
+                    response,
                 )
 
             if request.action == "reopen":
                 self._telegram.reopen_forum_topic(message.chat_id, session.message_thread_id)
                 self._sessions.set_topic_session_closed(session.session_key, False)
                 response = f"Reopened topic `{session.topic_name}`."
-                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                if notify_general:
+                    self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
                 return GeneralControllerOutcome(
                     True,
                     self._general_action_memory_text("reopen_topic", target=session.topic_name),
+                    True,
+                    response,
                 )
 
             if request.action == "delete":
@@ -617,10 +688,13 @@ class CodexTelegramGateway:
                 self._sessions.clear_model_preference(session.session_key)
                 self._sessions.clear_sandbox_mode(session.session_key)
                 response = f"Deleted topic `{session.topic_name}` and removed only its bridge session state."
-                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                if notify_general:
+                    self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
                 return GeneralControllerOutcome(
                     True,
                     self._general_action_memory_text("delete_topic", target=session.topic_name),
+                    True,
+                    response,
                 )
         except TelegramAPIError:
             logger.warning(
@@ -634,12 +708,14 @@ class CodexTelegramGateway:
                 f"I could not {request.action} topic `{session.topic_name}`. "
                 "Check the bot's topic admin permissions and whether the topic still exists."
             )
-            self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
-            return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+            if notify_general:
+                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+            return GeneralControllerOutcome(True, self._general_reply_memory_text(response), False, response)
 
         response = "I did not recognize that topic lifecycle action."
-        self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
-        return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+        if notify_general:
+            self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+        return GeneralControllerOutcome(True, self._general_reply_memory_text(response), False, response)
 
     def _topic_agent_intro(
         self,
@@ -683,12 +759,15 @@ class CodexTelegramGateway:
         self,
         message: IncomingMessage,
         request: SessionProvisioningRequest,
+        *,
+        notify_general: bool = True,
     ) -> GeneralControllerOutcome:
         topic_name = request.topic_name.strip()[:128]
         if not topic_name:
             response = "I need a non-empty topic name for that session."
-            self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
-            return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+            if notify_general:
+                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+            return GeneralControllerOutcome(True, self._general_reply_memory_text(response), False, response)
 
         try:
             topic = self._telegram.create_forum_topic(message.chat_id, topic_name)
@@ -698,8 +777,9 @@ class CodexTelegramGateway:
                 "I could not create a forum topic for that session. "
                 "Check that topics are enabled and the bot can manage topics."
             )
-            self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
-            return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+            if notify_general:
+                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+            return GeneralControllerOutcome(True, self._general_reply_memory_text(response), False, response)
         topic_key = f"{message.chat_id}:thread:{topic.message_thread_id}"
         self._sessions.save_active_workspace(topic_key, request.workspace_relative)
         self._sessions.save_model_preference(
@@ -726,8 +806,9 @@ class CodexTelegramGateway:
             ready_text,
             message_thread_id=topic.message_thread_id,
         )
-        response = f"Created topic `{topic.name}` and configured the Codex session there."
-        self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+        response = f"Created topic `{topic.name}` #{topic.message_thread_id} and configured the Codex session there."
+        if notify_general:
+            self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
         return GeneralControllerOutcome(
             True,
             self._general_action_memory_text(
@@ -736,7 +817,11 @@ class CodexTelegramGateway:
                 model=request.model.slug,
                 reasoning_effort=request.reasoning_effort,
                 sandbox_mode=request.sandbox_mode,
+                topic_name=topic.name,
+                thread_id=str(topic.message_thread_id),
             ),
+            True,
+            response,
         )
 
     def _controller_create_request(self, action: dict[str, object]) -> tuple[SessionProvisioningRequest | None, str | None]:
@@ -792,37 +877,42 @@ class CodexTelegramGateway:
         self,
         message: IncomingMessage,
         action: dict[str, object],
+        *,
+        notify_general: bool = True,
     ) -> GeneralControllerOutcome:
         action_name = self._action_text(action, "action")
         if action_name == "create_topic_session":
             request, error = self._controller_create_request(action)
             if request is None:
                 response = error or "I could not configure that topic session."
-                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
-                return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
-            return self._create_topic_session(message, request)
+                if notify_general:
+                    self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                return GeneralControllerOutcome(True, self._general_reply_memory_text(response), False, response)
+            return self._create_topic_session(message, request, notify_general=notify_general)
 
         if action_name == "reply":
             response = self._telegram_response_text(
                 self._action_text(action, "text") or "I need more detail to manage the group."
             )
-            self._telegram.send_message(
-                message.chat_id,
-                response,
-                reply_to_message_id=message.message_id,
-            )
-            return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+            if notify_general:
+                self._telegram.send_message(
+                    message.chat_id,
+                    response,
+                    reply_to_message_id=message.message_id,
+                )
+            return GeneralControllerOutcome(True, self._general_reply_memory_text(response), True, response)
 
         if action_name == "report_metadata":
-            return self._handle_metadata_report_request(message)
+            return self._handle_metadata_report_request(message, notify_general=notify_general)
 
         if action_name == "rename_group":
             title = self._action_text(action, "title")
             if title is None:
                 response = "I need the new group title."
-                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
-                return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
-            return self._handle_group_rename_request(message, title)
+                if notify_general:
+                    self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                return GeneralControllerOutcome(True, self._general_reply_memory_text(response), False, response)
+            return self._handle_group_rename_request(message, title, notify_general=notify_general)
 
         lifecycle_actions = {
             "rename_topic": "rename",
@@ -834,30 +924,60 @@ class CodexTelegramGateway:
             target = self._action_text(action, "target")
             if target is None:
                 response = "I need the topic name or thread id."
-                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
-                return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+                if notify_general:
+                    self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                return GeneralControllerOutcome(True, self._general_reply_memory_text(response), False, response)
             new_name = self._action_text(action, "new_name")
             if action_name == "rename_topic" and new_name is None:
                 response = "I need the new topic name."
-                self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
-                return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+                if notify_general:
+                    self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+                return GeneralControllerOutcome(True, self._general_reply_memory_text(response), False, response)
             request = TopicLifecycleRequest(
                 action=lifecycle_actions[action_name],
                 target=target,
                 new_name=new_name,
             )
-            return self._handle_topic_lifecycle_request(message, request)
+            return self._handle_topic_lifecycle_request(message, request, notify_general=notify_general)
 
         response = (
             "I could not decide which group action to take. Ask for a topic/session action with workspace, "
             "model, thinking, and sandbox."
         )
+        if notify_general:
+            self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
+        return GeneralControllerOutcome(True, self._general_reply_memory_text(response), False, response)
+
+    def _handle_general_controller_actions(
+        self,
+        message: IncomingMessage,
+        actions: list[dict[str, object]],
+    ) -> GeneralControllerOutcome:
+        if len(actions) == 1:
+            return self._handle_general_controller_action(message, actions[0])
+
+        outcomes = [
+            self._handle_general_controller_action(message, action, notify_general=False)
+            for action in actions
+        ]
+        succeeded = sum(1 for outcome in outcomes if outcome.success)
+        lines = [f"Completed {succeeded} of {len(outcomes)} requested actions."]
+        for index, outcome in enumerate(outcomes, start=1):
+            status = "OK" if outcome.success else "Failed"
+            lines.append(f"{index}. {status}: {outcome.summary or outcome.memory_text}")
+        response = self._telegram_response_text("\n".join(lines))
         self._telegram.send_message(message.chat_id, response, reply_to_message_id=message.message_id)
-        return GeneralControllerOutcome(True, self._general_reply_memory_text(response))
+        return GeneralControllerOutcome(
+            True,
+            self._general_batch_memory_text(outcomes),
+            succeeded == len(outcomes),
+            response,
+        )
 
     def _handle_general_forum_message(self, message: IncomingMessage) -> bool:
-        action = self._run_general_controller(message)
-        if action is None:
+        payload = self._run_general_controller(message)
+        actions = self._controller_actions(payload) if payload is not None else None
+        if actions is None:
             response = "I could not understand the General-chat controller response. Try again with workspace, model, thinking, and sandbox."
             self._telegram.send_message(
                 message.chat_id,
@@ -867,7 +987,7 @@ class CodexTelegramGateway:
             self._sessions.append(message.chat_id, "user", sanitize_general_memory_text(message.text))
             self._sessions.append(message.chat_id, "assistant", self._general_reply_memory_text(response))
             return True
-        outcome = self._handle_general_controller_action(message, action)
+        outcome = self._handle_general_controller_actions(message, actions)
         self._sessions.append(message.chat_id, "user", sanitize_general_memory_text(message.text))
         self._sessions.append(message.chat_id, "assistant", outcome.memory_text)
         return outcome.handled

@@ -142,6 +142,10 @@ sandbox mode. The controller agent converts the request into a validated bridge
 action; the bridge then creates or manages the Telegram topic. When a new topic
 is created, the topic-scoped Codex agent sends the first message in that topic,
 and later messages in that topic route only to that topic's agent session.
+General can also perform multiple ordered actions from one message, such as
+creating two topic sessions, creating then renaming a topic, or deleting several
+recorded topic sessions. The bridge keeps successful actions even when a later
+action in the same request fails, then replies in General with one batch summary.
 
 `/fast` is also topic-scoped. It keeps the current model and sandbox, but runs
 that topic with the lowest supported reasoning effort until `/fast off` is sent

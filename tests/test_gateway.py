@@ -3460,10 +3460,245 @@ class GatewayTests(unittest.TestCase):
                     (
                         'Controller action succeeded: {"action": "create_topic_session", '
                         '"model": "gpt-5.5", "reasoning_effort": "high", '
-                        '"sandbox_mode": "yolo", "workspace": "kitia"}'
+                        '"sandbox_mode": "yolo", "thread_id": "50", '
+                        '"topic_name": "kitia | gpt-5.5 high | yolo", "workspace": "kitia"}'
                     ),
                 ],
             )
+
+    def test_general_controller_batch_creates_two_topic_sessions(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kitia = root / "kitia"
+            salona = root / "salona"
+            kitia.mkdir()
+            salona.mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                [
+                    json.dumps(
+                        {
+                            "actions": [
+                                {
+                                    "action": "create_topic_session",
+                                    "workspace": "kitia",
+                                    "model": "gpt-5.5",
+                                    "reasoning_effort": "high",
+                                    "sandbox_mode": "yolo",
+                                    "topic_name": "kitia agent",
+                                },
+                                {
+                                    "action": "create_topic_session",
+                                    "workspace": "salona",
+                                    "model": "gpt-5.4-mini",
+                                    "reasoning_effort": "low",
+                                    "sandbox_mode": "constrained",
+                                    "topic_name": "salona agent",
+                                },
+                            ]
+                        }
+                    ),
+                    "Kitia agent ready.",
+                    "Salona agent ready.",
+                ]
+            )
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message(
+                    "make two topics: kitia high yolo and salona mini low constrained",
+                    chat_id="-1001",
+                    chat_type="supergroup",
+                )
+            )
+
+            self.assertEqual(
+                telegram.created_topics,
+                [
+                    ("-1001", "kitia agent"),
+                    ("-1001", "salona agent"),
+                ],
+            )
+            self.assertEqual(telegram.message_threads, [50, 51, None])
+            self.assertIn("Kitia agent ready.", telegram.messages[0][1])
+            self.assertIn("Salona agent ready.", telegram.messages[1][1])
+            self.assertIn("Completed 2 of 2 requested actions.", telegram.messages[2][1])
+            self.assertIn("Created topic `kitia agent` #50", telegram.messages[2][1])
+            self.assertIn("Created topic `salona agent` #51", telegram.messages[2][1])
+            self.assertEqual(store.load_active_workspace("-1001:thread:50"), "kitia")
+            self.assertEqual(store.load_active_workspace("-1001:thread:51"), "salona")
+            first_preference = store.load_model_preference("-1001:thread:50")
+            second_preference = store.load_model_preference("-1001:thread:51")
+            self.assertIsNotNone(first_preference)
+            self.assertIsNotNone(second_preference)
+            assert first_preference is not None
+            assert second_preference is not None
+            self.assertEqual(first_preference.model, "gpt-5.5")
+            self.assertEqual(second_preference.model, "gpt-5.4-mini")
+            stored = "\n".join(turn.text for turn in store.load("-1001"))
+            self.assertIn("Controller batch result:", stored)
+            self.assertIn("kitia agent", stored)
+            self.assertIn("salona agent", stored)
+            self.assertIn('"success": "yes"', stored)
+
+    def test_general_controller_batch_can_create_then_rename_topic(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                [
+                    json.dumps(
+                        {
+                            "actions": [
+                                {
+                                    "action": "create_topic_session",
+                                    "workspace": "kitia",
+                                    "model": "gpt-5.5",
+                                    "reasoning_effort": "high",
+                                    "sandbox_mode": "yolo",
+                                    "topic_name": "kitia temp",
+                                },
+                                {
+                                    "action": "rename_topic",
+                                    "target": "kitia temp",
+                                    "new_name": "kitia final",
+                                },
+                            ]
+                        }
+                    ),
+                    "Topic agent ready.",
+                ]
+            )
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message("make kitia temp and rename it kitia final", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.created_topics, [("-1001", "kitia temp")])
+            self.assertEqual(telegram.edited_forum_topics, [("-1001", 50, "kitia final")])
+            session = store.load_topic_session("-1001:thread:50")
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.topic_name, "kitia final")
+            self.assertEqual(telegram.message_threads, [50, None])
+            self.assertIn("Completed 2 of 2 requested actions.", telegram.messages[-1][1])
+            self.assertIn("Renamed topic `kitia temp` to `kitia final`.", telegram.messages[-1][1])
+
+    def test_general_controller_batch_deletes_multiple_topics(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            store = SessionStore(root / ".state")
+            for thread_id, topic_name in ((50, "kitia topic"), (51, "salona topic")):
+                store.save_topic_session(
+                    chat_id="-1001",
+                    message_thread_id=thread_id,
+                    session_key=f"-1001:thread:{thread_id}",
+                    topic_name=topic_name,
+                    workspace="",
+                    model="gpt-5.5",
+                    reasoning_effort="high",
+                    sandbox_mode="constrained",
+                )
+            codex = FakeCodex(
+                json.dumps(
+                    {
+                        "actions": [
+                            {"action": "delete_topic", "target": "kitia topic"},
+                            {"action": "delete_topic", "target": "salona topic"},
+                        ]
+                    }
+                )
+            )
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message("delete kitia and salona topics", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.deleted_forum_topics, [("-1001", 50), ("-1001", 51)])
+            self.assertIsNone(store.load_topic_session("-1001:thread:50"))
+            self.assertIsNone(store.load_topic_session("-1001:thread:51"))
+            self.assertEqual(len(telegram.messages), 1)
+            self.assertIn("Completed 2 of 2 requested actions.", telegram.messages[0][1])
+            self.assertIn("Deleted topic `kitia topic`", telegram.messages[0][1])
+            self.assertIn("Deleted topic `salona topic`", telegram.messages[0][1])
+
+    def test_general_controller_batch_keeps_successes_when_later_action_fails(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kitia").mkdir()
+            telegram = FakeTelegram()
+            codex = FakeCodex(
+                [
+                    json.dumps(
+                        {
+                            "actions": [
+                                {
+                                    "action": "create_topic_session",
+                                    "workspace": "kitia",
+                                    "model": "gpt-5.5",
+                                    "reasoning_effort": "high",
+                                    "sandbox_mode": "yolo",
+                                    "topic_name": "kitia agent",
+                                },
+                                {
+                                    "action": "create_topic_session",
+                                    "workspace": "missing",
+                                    "model": "gpt-5.5",
+                                    "reasoning_effort": "high",
+                                    "sandbox_mode": "yolo",
+                                    "topic_name": "missing agent",
+                                },
+                            ]
+                        }
+                    ),
+                    "Kitia agent ready.",
+                ]
+            )
+            store = SessionStore(root / ".state")
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=store,
+            )
+
+            gateway.handle_message(
+                self._message("make kitia and missing topics", chat_id="-1001", chat_type="supergroup")
+            )
+
+            self.assertEqual(telegram.created_topics, [("-1001", "kitia agent")])
+            self.assertIsNotNone(store.load_topic_session("-1001:thread:50"))
+            self.assertIn("Completed 1 of 2 requested actions.", telegram.messages[-1][1])
+            self.assertIn("OK: Created topic `kitia agent` #50", telegram.messages[-1][1])
+            self.assertIn("Failed: I could not find a workspace named `missing`", telegram.messages[-1][1])
+            stored = "\n".join(turn.text for turn in store.load("-1001"))
+            self.assertIn('"success": "yes"', stored)
+            self.assertIn('"success": "no"', stored)
 
     def test_general_controller_creates_topic_from_multiturn_context_without_confirmation(self):
         with TemporaryDirectory() as tmp:
