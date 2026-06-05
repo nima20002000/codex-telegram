@@ -50,7 +50,7 @@ CODEX_TELEGRAM_INSTALL_DIR="$HOME/Desktop/codex-telegram" \
 Local checkout install:
 
 ```bash
-cd /home/example/codex-telegram
+cd "$HOME/.local/share/codex-telegram"
 bash scripts/install.sh
 ```
 
@@ -97,11 +97,11 @@ a harmless `/status` marker without calling Bot API `getUpdates`:
 
 ```bash
 /tmp/codex-telegram-e2e-venv/bin/python scripts/telegram-e2e-preflight.py \
-  --env-file $HOME/.local/share/codex-telegram/.env \
+  --env-file "$HOME/.local/share/codex-telegram/.env" \
   --credentials telegram-cred.md \
   --session .codex-telegram/e2e/admin-account \
-  --group "Codex Telegram E2E" \
-  --expected-service-workdir $HOME/.local/share/codex-telegram \
+  --group "<forum-group-title>" \
+  --expected-service-workdir "$HOME/.local/share/codex-telegram" \
   --expected-service-branch feature/add-feature \
   --marker
 ```
@@ -120,7 +120,9 @@ deployment check must prove the service is running a specific commit.
 - `/workspace`
 - `/sandbox`
 
-Any other text message is sent to `codex exec`.
+In private chats and topic-scoped sessions, any other text message is sent to
+`codex exec`. In a forum group's General chat, free-form text is handled by the
+General controller agent, which can create and manage topic sessions.
 
 While Codex is working, the bridge may post short progress messages in the same
 topic, such as local command start/finish notices. Progress messages are

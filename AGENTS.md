@@ -62,11 +62,11 @@ Telethon scripts:
 
 ```bash
 /tmp/codex-telegram-e2e-venv/bin/python scripts/telegram-e2e-preflight.py \
-  --env-file $HOME/.local/share/codex-telegram/.env \
+  --env-file "$HOME/.local/share/codex-telegram/.env" \
   --credentials telegram-cred.md \
   --session .codex-telegram/e2e/admin-account \
-  --group "Codex Telegram E2E" \
-  --expected-service-workdir $HOME/.local/share/codex-telegram \
+  --group "<forum-group-title>" \
+  --expected-service-workdir "$HOME/.local/share/codex-telegram" \
   --expected-service-branch feature/add-feature \
   --marker
 ```

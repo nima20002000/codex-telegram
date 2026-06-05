@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/Desktop/codex-telegram
-Environment=PYTHONPATH=%h/Desktop/codex-telegram/src
-ExecStart=/usr/bin/python3 -m codex_telegram.cli --env-file %h/Desktop/codex-telegram/.env
+WorkingDirectory=%h/.local/share/codex-telegram
+Environment=PYTHONPATH=%h/.local/share/codex-telegram/src
+ExecStart=/usr/bin/python3 -m codex_telegram.cli --env-file %h/.local/share/codex-telegram/.env
 Restart=on-failure
 RestartSec=5
 

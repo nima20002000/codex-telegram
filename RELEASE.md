@@ -26,11 +26,11 @@ Before merging a feature branch to `main`:
    release_branch="$(git branch --show-current)"
    candidate_sha="$(git rev-parse --short HEAD)"
    /tmp/codex-telegram-e2e-venv/bin/python scripts/telegram-e2e-preflight.py \
-     --env-file $HOME/.local/share/codex-telegram/.env \
+     --env-file "$HOME/.local/share/codex-telegram/.env" \
      --credentials telegram-cred.md \
      --session .codex-telegram/e2e/admin-account \
-     --group "Codex Telegram E2E" \
-     --expected-service-workdir $HOME/.local/share/codex-telegram \
+     --group "<forum-group-title>" \
+     --expected-service-workdir "$HOME/.local/share/codex-telegram" \
      --expected-service-branch "$release_branch" \
      --expected-service-commit "$candidate_sha" \
      --marker
@@ -69,7 +69,7 @@ force a merge with a dirty worktree or after a failed review/E2E gate.
 After tagging, update the installed checkout deliberately:
 
 ```bash
-cd $HOME/.local/share/codex-telegram
+cd "$HOME/.local/share/codex-telegram"
 git fetch --all --tags
 git checkout main
 git pull --ff-only
@@ -87,7 +87,7 @@ To roll back the installed service, choose the previous known-good tag or commit
 then reinstall/restart from that checkout:
 
 ```bash
-cd $HOME/.local/share/codex-telegram
+cd "$HOME/.local/share/codex-telegram"
 git checkout <previous-tag-or-commit>
 bash scripts/install.sh
 systemctl --user restart codex-telegram.service
