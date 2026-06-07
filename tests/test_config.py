@@ -56,6 +56,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(settings.bot_token, "env-token")
             self.assertEqual(settings.allowed_users, frozenset({123, 456}))
             self.assertEqual(settings.codex_workdir, workdir.resolve())
+            self.assertFalse(settings.telegram_disable_link_previews)
 
     def test_legacy_state_dir_env_var_is_used_as_fallback(self):
         with TemporaryDirectory() as tmp:
@@ -76,6 +77,30 @@ class ConfigTests(unittest.TestCase):
     def test_settings_requires_token(self):
         with self.assertRaisesRegex(ValueError, "TELEGRAM_BOT_TOKEN"):
             Settings.from_env(environ={})
+
+    def test_settings_can_disable_telegram_link_previews(self):
+        with TemporaryDirectory() as tmp:
+            workdir = Path(tmp) / "repo"
+            workdir.mkdir()
+
+            settings = Settings.from_env(
+                environ={
+                    "TELEGRAM_BOT_TOKEN": "token",
+                    "CODEX_WORKDIR": str(workdir),
+                    "TELEGRAM_DISABLE_LINK_PREVIEWS": "true",
+                }
+            )
+
+            self.assertTrue(settings.telegram_disable_link_previews)
+
+    def test_settings_rejects_invalid_boolean_link_preview_flag(self):
+        with self.assertRaisesRegex(ValueError, "TELEGRAM_DISABLE_LINK_PREVIEWS"):
+            Settings.from_env(
+                environ={
+                    "TELEGRAM_BOT_TOKEN": "token",
+                    "TELEGRAM_DISABLE_LINK_PREVIEWS": "sometimes",
+                }
+            )
 
     def test_empty_environ_does_not_read_ambient_environment(self):
         with self.assertRaisesRegex(ValueError, "TELEGRAM_BOT_TOKEN"):

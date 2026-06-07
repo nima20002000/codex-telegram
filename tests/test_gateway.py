@@ -226,6 +226,7 @@ class GatewayTests(unittest.TestCase):
             codex_timeout_seconds=10,
             telegram_poll_timeout_seconds=30,
             telegram_request_timeout_seconds=45,
+            telegram_disable_link_previews=False,
             max_telegram_response_chars=max_telegram_response_chars,
             session_history_turns=8,
             state_dir=workdir / ".state",
@@ -1038,6 +1039,35 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(telegram.messages[-1][1], "final response")
             self.assertEqual(telegram.message_threads[-1], 7)
             self.assertEqual(store.load("-1001:thread:8"), [])
+
+    def test_progress_dedupe_survives_typing_restore_failure(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            telegram = FakeTelegram()
+            telegram.fail_chat_action = True
+            gateway = CodexTelegramGateway(
+                settings=self._settings(root),
+                telegram=telegram,
+                codex=FakeCodex(),
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(root / ".state"),
+            )
+            callback = gateway._progress_callback_for_message(self._message("do work", chat_id="-1001", message_thread_id=7))
+            event = {
+                "type": "item.started",
+                "item": {
+                    "type": "command_execution",
+                    "command": "/bin/bash -lc pwd",
+                    "status": "in_progress",
+                },
+            }
+
+            callback(event)
+            callback(event)
+
+            self.assertEqual(len(telegram.messages), 1)
+            self.assertIn("Working: running a local command", telegram.messages[0][1])
+            self.assertEqual(telegram.message_threads, [7])
 
     def test_goal_command_is_topic_scoped_and_general_chat_does_not_mutate_topics(self):
         with TemporaryDirectory() as tmp:

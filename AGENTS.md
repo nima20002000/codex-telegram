@@ -78,6 +78,12 @@ be proven to run a specific checkout. If the service is intentionally stopped
 because a foreground bridge is running from this checkout, pass
 `--skip-service-check` and record that choice in the Linear evidence.
 
+For Telegram UI parity checks, add `--ui-parity` to the same preflight command.
+This sends a harmless Markdown fixture, waits for the bot reply, and verifies
+that Telegram returned rendered entities instead of raw Markdown markers. Record
+the redacted `[PASS] ui parity ...` lines in Linear with the review output path
+and commit hash.
+
 ## Commit & Pull Request Guidelines
 
 Recent commits use short imperative subjects, for example `Add Telegram model picker` and `Fix stale Codex model preferences`. Keep commits scoped to one behavior change and include tests or a clear reason tests were not run. Pull requests should describe the runtime impact, list validation commands, and mention any configuration or systemd changes. Include screenshots only for Telegram UI-visible command or button changes.

@@ -1485,6 +1485,10 @@ class CodexTelegramGateway:
                 return
             last_sent_at = now
             last_text = text
+            try:
+                self._telegram.send_chat_action(message.chat_id, message_thread_id=message.message_thread_id)
+            except Exception:
+                logger.warning("Failed to restore Telegram typing indicator after progress message", exc_info=True)
 
         return callback
 

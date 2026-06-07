@@ -41,6 +41,7 @@ def main(argv: list[str] | None = None) -> int:
     telegram = TelegramAPI(
         settings.bot_token,
         request_timeout_seconds=settings.telegram_request_timeout_seconds,
+        disable_link_previews=settings.telegram_disable_link_previews,
     )
     try:
         telegram.set_bot_commands(BOT_COMMANDS)

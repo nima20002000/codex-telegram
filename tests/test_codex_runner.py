@@ -53,6 +53,7 @@ class CodexRunnerTests(unittest.TestCase):
             codex_timeout_seconds=10,
             telegram_poll_timeout_seconds=30,
             telegram_request_timeout_seconds=45,
+            telegram_disable_link_previews=False,
             max_telegram_response_chars=12000,
             session_history_turns=8,
             state_dir=workdir / ".state",

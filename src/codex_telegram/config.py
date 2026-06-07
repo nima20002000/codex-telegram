@@ -54,6 +54,17 @@ def _int_env(env: Mapping[str, str], key: str, default: int) -> int:
     return int(raw)
 
 
+def _bool_env(env: Mapping[str, str], key: str, default: bool) -> bool:
+    raw = env.get(key, "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Unsupported boolean value for {key}: {env.get(key)}")
+
+
 @dataclass(frozen=True)
 class Settings:
     bot_token: str
@@ -68,6 +79,7 @@ class Settings:
     codex_timeout_seconds: int
     telegram_poll_timeout_seconds: int
     telegram_request_timeout_seconds: int
+    telegram_disable_link_previews: bool
     max_telegram_response_chars: int
     session_history_turns: int
     state_dir: Path
@@ -113,6 +125,7 @@ class Settings:
             codex_timeout_seconds=_int_env(env, "CODEX_TIMEOUT_SECONDS", 1800),
             telegram_poll_timeout_seconds=_int_env(env, "TELEGRAM_POLL_TIMEOUT_SECONDS", 30),
             telegram_request_timeout_seconds=_int_env(env, "TELEGRAM_REQUEST_TIMEOUT_SECONDS", 45),
+            telegram_disable_link_previews=_bool_env(env, "TELEGRAM_DISABLE_LINK_PREVIEWS", False),
             max_telegram_response_chars=_int_env(env, "MAX_TELEGRAM_RESPONSE_CHARS", 12000),
             session_history_turns=_int_env(env, "SESSION_HISTORY_TURNS", 8),
             state_dir=state_dir,

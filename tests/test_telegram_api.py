@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import unittest
+import re
 
-from codex_telegram.telegram_api import TelegramAPI, parse_callback_update, parse_message_update, split_telegram_text
+from codex_telegram.telegram_api import TelegramAPI, TelegramAPIError, parse_callback_update, parse_message_update, split_telegram_text
 
 
 class RecordingTelegramAPI(TelegramAPI):
@@ -10,9 +11,13 @@ class RecordingTelegramAPI(TelegramAPI):
         super().__init__("token")
         self.requests: list[tuple[str, dict]] = []
         self.responses: dict[str, dict] = {}
+        self.errors: dict[str, list[TelegramAPIError]] = {}
 
     def _request(self, method, params):
         self.requests.append((method, params))
+        errors = self.errors.get(method)
+        if errors:
+            raise errors.pop(0)
         if method in self.responses:
             return self.responses[method]
         return {"ok": True, "result": True}
@@ -73,7 +78,7 @@ class TelegramAPITests(unittest.TestCase):
     def test_send_message_can_target_forum_topic(self):
         telegram = RecordingTelegramAPI()
 
-        telegram.send_message("123", "hello", reply_to_message_id=8, message_thread_id=5)
+        telegram.send_message("123", "**hello**", reply_to_message_id=8, message_thread_id=5)
 
         self.assertEqual(
             telegram.requests,
@@ -82,10 +87,11 @@ class TelegramAPITests(unittest.TestCase):
                     "sendMessage",
                     {
                         "chat_id": "123",
-                        "text": "hello",
+                        "text": "*hello*",
                         "message_thread_id": 5,
                         "reply_to_message_id": 8,
-                        "disable_web_page_preview": True,
+                        "parse_mode": "MarkdownV2",
+                        "disable_web_page_preview": None,
                         "reply_markup": None,
                     },
                 )
@@ -176,6 +182,77 @@ class TelegramAPITests(unittest.TestCase):
         chunks = [params for method, params in telegram.requests if method == "sendMessage"]
         self.assertGreater(len(chunks), 1)
         self.assertTrue(all(chunk["message_thread_id"] == 5 for chunk in chunks))
+        self.assertTrue(chunks[0]["text"].endswith("\\(1/2\\)"))
+
+    def test_split_send_message_groups_continuations_when_message_ids_are_returned(self):
+        telegram = RecordingTelegramAPI()
+
+        def response(message_id):
+            return {"ok": True, "result": {"message_id": message_id}}
+
+        telegram.responses["sendMessage"] = response(10)
+        calls = 0
+
+        def request(method, params):
+            nonlocal calls
+            telegram.requests.append((method, params))
+            calls += 1
+            return response(9 + calls)
+
+        telegram._request = request
+
+        telegram.send_message("123", "a" * 5000, reply_to_message_id=8, message_thread_id=5)
+
+        chunks = [params for method, params in telegram.requests if method == "sendMessage"]
+        self.assertEqual(chunks[0]["reply_to_message_id"], 8)
+        self.assertEqual(chunks[1]["reply_to_message_id"], 10)
+
+    def test_send_message_retries_markdown_parse_error_as_plain_text(self):
+        telegram = RecordingTelegramAPI()
+        telegram.errors["sendMessage"] = [TelegramAPIError("Bad Request: can't parse entities")]
+
+        telegram.send_message("123", "**hello**")
+
+        first = telegram.requests[0][1]
+        second = telegram.requests[1][1]
+        self.assertEqual(first["text"], "*hello*")
+        self.assertEqual(first["parse_mode"], "MarkdownV2")
+        self.assertEqual(second["text"], "hello")
+        self.assertIsNone(second["parse_mode"])
+
+    def test_send_message_does_not_retry_non_markdown_parse_error(self):
+        telegram = RecordingTelegramAPI()
+        telegram.errors["sendMessage"] = [TelegramAPIError("Bad Request: can't parse reply keyboard markup")]
+
+        with self.assertRaises(TelegramAPIError):
+            telegram.send_message("123", "**hello**", reply_markup={"inline_keyboard": "bad"})
+
+        self.assertEqual(len(telegram.requests), 1)
+        self.assertEqual(telegram.requests[0][1]["parse_mode"], "MarkdownV2")
+
+    def test_link_previews_are_allowed_by_default_and_can_be_disabled(self):
+        default = RecordingTelegramAPI()
+        disabled = RecordingTelegramAPI()
+        disabled._disable_link_previews = True
+
+        default.send_message("123", "[OpenAI](https://openai.com)")
+        disabled.send_message("123", "[OpenAI](https://openai.com)")
+
+        self.assertIsNone(default.requests[0][1]["disable_web_page_preview"])
+        self.assertTrue(disabled.requests[0][1]["disable_web_page_preview"])
+
+    def test_edit_message_uses_markdown_and_plain_fallback(self):
+        telegram = RecordingTelegramAPI()
+        telegram.errors["editMessageText"] = [TelegramAPIError("Bad Request: can't parse entities")]
+
+        telegram.edit_message_text("123", 5, "# Title")
+
+        first = telegram.requests[0][1]
+        second = telegram.requests[1][1]
+        self.assertEqual(first["text"], "*Title*")
+        self.assertEqual(first["parse_mode"], "MarkdownV2")
+        self.assertEqual(second["text"], "Title")
+        self.assertIsNone(second["parse_mode"])
 
     def test_send_chat_action_can_target_forum_topic(self):
         telegram = RecordingTelegramAPI()
@@ -215,7 +292,8 @@ class TelegramAPITests(unittest.TestCase):
         text = "a" * 100 + " \n    " + "b" * 100
         chunks = split_telegram_text(text, limit=120)
         self.assertGreater(len(chunks), 1)
-        self.assertEqual("".join(chunks), text)
+        restored = "".join(re.sub(r" \\\(\d+/\d+\\\)$", "", chunk) for chunk in chunks)
+        self.assertEqual(restored, text)
 
     def test_set_bot_commands_uses_short_menu(self):
         telegram = RecordingTelegramAPI()

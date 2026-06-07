@@ -252,6 +252,7 @@ async def run_telegram_checks(
     group_title: str,
     bot_identity: BotIdentity,
     marker: bool,
+    ui_parity: bool,
     marker_timeout_seconds: int,
 ) -> list[CheckResult]:
     try:
@@ -356,12 +357,77 @@ async def run_telegram_checks(
                     f"reply message id={getattr(reply, 'id', 'unknown')}" if reply is not None else "no bot reply before timeout",
                 )
             )
+        if ui_parity:
+            marker_value = f"nim-ui-parity-{int(time.time())}"
+            prompt = (
+                "Reply only with the Markdown fixture below for Telegram UI verification. "
+                "Do not modify files. Include all text exactly.\n\n"
+                f"{marker_value}\n\n"
+                "# UI Heading\n"
+                "This has **bold**, *italic*, `inline_code`, and [a link](https://example.com).\n\n"
+                "```python\n"
+                "print('ui parity')\n"
+                "```\n\n"
+                "| Item | Status |\n"
+                "|---|---|\n"
+                "| Alpha | Done |"
+            )
+            sent = await client.send_message(entity, prompt, parse_mode=None)
+            reply = await _wait_for_bot_reply(
+                client,
+                entity,
+                bot_user_id,
+                after_id=int(sent.id),
+                timeout_seconds=marker_timeout_seconds,
+                text_contains=marker_value,
+            )
+            await asyncio.sleep(2)
+            related = await _bot_reply_chain_after(
+                client,
+                entity,
+                bot_user_id,
+                root_message_id=int(getattr(reply, "id", 0)) if reply is not None else None,
+                after_id=int(sent.id),
+            )
+            results.extend(_ui_parity_results(reply, marker_value, related_messages=related))
+            long_marker = f"nim-ui-long-{int(time.time())}"
+            long_prompt = (
+                "Reply only with this marker, then write the word LongSegment followed by a space "
+                "exactly 460 times. Do not modify files.\n\n"
+                f"{long_marker}"
+            )
+            long_sent = await client.send_message(entity, long_prompt, parse_mode=None)
+            long_reply = await _wait_for_bot_reply(
+                client,
+                entity,
+                bot_user_id,
+                after_id=int(long_sent.id),
+                timeout_seconds=marker_timeout_seconds,
+                text_contains=long_marker,
+            )
+            await asyncio.sleep(2)
+            long_related = await _bot_reply_chain_after(
+                client,
+                entity,
+                bot_user_id,
+                root_message_id=int(getattr(long_reply, "id", 0)) if long_reply is not None else None,
+                after_id=int(long_sent.id),
+            )
+            results.extend(_ui_long_results(long_reply, long_marker, related_messages=long_related))
     finally:
         await client.disconnect()
     return results
 
 
-async def _wait_for_bot_reply(client: Any, entity: Any, bot_id: int, *, after_id: int, timeout_seconds: int) -> Any | None:
+async def _wait_for_bot_reply(
+    client: Any,
+    entity: Any,
+    bot_id: int,
+    *,
+    after_id: int,
+    timeout_seconds: int,
+    text_contains: str | None = None,
+) -> Any | None:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         async for message in client.iter_messages(entity, limit=40):
@@ -370,9 +436,105 @@ async def _wait_for_bot_reply(client: Any, entity: Any, bot_id: int, *, after_id
             if getattr(message, "sender_id", None) == bot_id:
                 if not message_replies_to(message, after_id):
                     continue
+                if text_contains is not None:
+                    raw_text = str(getattr(message, "raw_text", "") or getattr(message, "text", "") or "")
+                    if text_contains not in raw_text:
+                        continue
                 return message
         await asyncio.sleep(1.5)
     return None
+
+
+async def _bot_reply_chain_after(
+    client: Any,
+    entity: Any,
+    bot_id: int,
+    *,
+    root_message_id: int | None,
+    after_id: int,
+    limit: int = 80,
+) -> list[Any]:
+    if root_message_id is None:
+        return []
+    candidates: list[Any] = []
+    async for message in client.iter_messages(entity, limit=limit):
+        if int(getattr(message, "id", 0)) <= after_id:
+            continue
+        if getattr(message, "sender_id", None) == bot_id:
+            candidates.append(message)
+    candidates.sort(key=lambda item: int(getattr(item, "id", 0)))
+
+    chain_ids = {root_message_id}
+    chain: list[Any] = []
+    for message in candidates:
+        message_id = int(getattr(message, "id", 0))
+        if message_id == root_message_id or any(message_replies_to(message, chain_id) for chain_id in chain_ids):
+            chain.append(message)
+            chain_ids.add(message_id)
+    return chain
+
+
+def _entity_type_names(message: Any) -> set[str]:
+    entities = getattr(message, "entities", None) or []
+    return {entity.__class__.__name__ for entity in entities}
+
+
+def _ui_parity_results(reply: Any | None, marker: str, *, related_messages: list[Any] | None = None) -> list[CheckResult]:
+    if reply is None:
+        return [CheckResult("ui parity reply", False, "no bot reply before timeout")]
+
+    raw_text = str(getattr(reply, "raw_text", "") or getattr(reply, "text", "") or "")
+    entity_names = _entity_type_names(reply)
+    related_text = "\n".join(str(getattr(message, "raw_text", "") or getattr(message, "text", "") or "") for message in related_messages or [reply])
+    related_entity_names: set[str] = set()
+    for message in related_messages or [reply]:
+        related_entity_names.update(_entity_type_names(message))
+    expected_entities = {
+        "MessageEntityBold",
+        "MessageEntityCode",
+        "MessageEntityItalic",
+        "MessageEntityPre",
+        "MessageEntityTextUrl",
+    }
+    markdown_absent = "# UI Heading" not in raw_text and "**bold**" not in raw_text and "`inline_code`" not in raw_text
+    table_readable = "|---|" not in related_text and "| Alpha | Done |" not in related_text and "Alpha" in related_text and "• Status: Done" in related_text
+    return [
+        CheckResult("ui parity reply", True, f"reply message id={getattr(reply, 'id', 'unknown')}"),
+        CheckResult("ui parity marker", marker in raw_text, "marker present" if marker in raw_text else "marker missing from reply text"),
+        CheckResult(
+            "ui parity markdown rendered",
+            markdown_absent,
+            "raw Markdown markers absent" if markdown_absent else "raw Markdown markers still visible",
+        ),
+        CheckResult(
+            "ui parity entities",
+            expected_entities.issubset(related_entity_names),
+            f"entities={','.join(sorted(related_entity_names)) or 'none'}",
+        ),
+        CheckResult(
+            "ui parity table readable",
+            table_readable,
+            "table delimiter absent" if table_readable else "raw table delimiter visible or no table content",
+        ),
+    ]
+
+
+def _ui_long_results(reply: Any | None, marker: str, *, related_messages: list[Any] | None = None) -> list[CheckResult]:
+    if reply is None:
+        return [CheckResult("ui parity long reply", False, "no bot reply before timeout")]
+
+    raw_text = str(getattr(reply, "raw_text", "") or getattr(reply, "text", "") or "")
+    related_text = "\n".join(str(getattr(message, "raw_text", "") or getattr(message, "text", "") or "") for message in related_messages or [reply])
+    long_chunked = "(1/" in related_text and "(2/" in related_text
+    return [
+        CheckResult("ui parity long reply", True, f"reply message id={getattr(reply, 'id', 'unknown')}"),
+        CheckResult("ui parity long marker", marker in raw_text, "marker present" if marker in raw_text else "marker missing from reply text"),
+        CheckResult(
+            "ui parity long chunks",
+            long_chunked,
+            "part indicators present" if long_chunked else "part indicators missing",
+        ),
+    ]
 
 
 def _print_results(results: Iterable[CheckResult], *, token: str | None, api_hash: str | None) -> bool:
@@ -395,6 +557,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-service-branch", help="Fail if the service checkout is on a different branch.")
     parser.add_argument("--expected-service-commit", help="Fail if the service checkout is on a different short commit.")
     parser.add_argument("--marker", action="store_true", help="Send a harmless /status marker and wait for the bot reply.")
+    parser.add_argument("--ui-parity", action="store_true", help="Send a harmless Markdown fixture and inspect Telegram-rendered reply entities.")
     parser.add_argument("--marker-timeout-seconds", type=int, default=60)
     return parser
 
@@ -434,6 +597,7 @@ def main(argv: list[str] | None = None) -> int:
                     group_title=args.group,
                     bot_identity=bot_identity,
                     marker=args.marker,
+                    ui_parity=args.ui_parity,
                     marker_timeout_seconds=args.marker_timeout_seconds,
                 )
             )

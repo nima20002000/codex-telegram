@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from pathlib import Path
 
@@ -7,6 +8,10 @@ from codex_telegram.e2e_harness import (
     BotIdentity,
     CheckResult,
     ServiceStatus,
+    _bot_reply_chain_after,
+    _ui_long_results,
+    _ui_parity_results,
+    _wait_for_bot_reply,
     bot_api_chat_id,
     bot_lookup_reference,
     check_service,
@@ -105,6 +110,105 @@ class E2EHarnessTests(unittest.TestCase):
 
     def test_format_check(self):
         self.assertEqual(format_check(CheckResult("service", True, "running")), "[PASS] service: running")
+
+    def test_ui_parity_results_require_rendered_entities(self):
+        bold = type("MessageEntityBold", (), {})()
+        code = type("MessageEntityCode", (), {})()
+        italic = type("MessageEntityItalic", (), {})()
+        pre = type("MessageEntityPre", (), {})()
+        text_url = type("MessageEntityTextUrl", (), {})()
+        reply = type(
+            "Message",
+            (),
+            {
+                "id": 10,
+                "raw_text": "nim-ui-parity-1\nUI Heading\nThis has bold, italic, inline_code.\nAlpha\n• Status: Done (1/2)",
+                "entities": [bold, code, italic, pre, text_url],
+            },
+        )()
+        continuation = type(
+            "Message",
+            (),
+            {
+                "id": 11,
+                "raw_text": "LongSegment LongSegment",
+                "entities": [],
+            },
+        )()
+
+        checks = _ui_parity_results(reply, "nim-ui-parity-1", related_messages=[reply, continuation])
+
+        self.assertTrue(all(check.passed for check in checks), checks)
+
+    def test_ui_parity_results_require_bold_and_code_entities(self):
+        code = type("MessageEntityCode", (), {})()
+        reply = type(
+            "Message",
+            (),
+            {
+                "id": 10,
+                "raw_text": "nim-ui-parity-1\nUI Heading\nThis has bold, inline_code.\nAlpha\n• Status: Done",
+                "entities": [code],
+            },
+        )()
+
+        checks = _ui_parity_results(reply, "nim-ui-parity-1", related_messages=[reply])
+        entity_check = next(check for check in checks if check.name == "ui parity entities")
+
+        self.assertFalse(entity_check.passed)
+
+    def test_ui_long_results_require_part_indicators(self):
+        reply = type("Message", (), {"id": 10, "raw_text": "nim-ui-long-1 LongSegment (1/2)", "entities": []})()
+        continuation = type("Message", (), {"id": 11, "raw_text": "LongSegment (2/2)", "entities": []})()
+
+        checks = _ui_long_results(reply, "nim-ui-long-1", related_messages=[reply, continuation])
+
+        self.assertTrue(all(check.passed for check in checks), checks)
+
+    def test_bot_reply_chain_after_filters_unrelated_bot_messages(self):
+        root = type("Message", (), {"id": 12, "sender_id": 7, "reply_to_msg_id": 5, "raw_text": "marker (1/2)"})()
+        continuation = type("Message", (), {"id": 13, "sender_id": 7, "reply_to_msg_id": 12, "raw_text": "continued (2/2)"})()
+        unrelated = type("Message", (), {"id": 14, "sender_id": 7, "reply_to_msg_id": 99, "raw_text": "unrelated"})()
+
+        class Client:
+            async def iter_messages(self, entity, limit):
+                yield unrelated
+                yield continuation
+                yield root
+
+        chain = asyncio.run(
+            _bot_reply_chain_after(
+                Client(),
+                object(),
+                7,
+                root_message_id=12,
+                after_id=5,
+            )
+        )
+
+        self.assertEqual(chain, [root, continuation])
+
+    def test_wait_for_bot_reply_can_filter_by_marker_text(self):
+        progress = type("Message", (), {"id": 11, "sender_id": 7, "reply_to_msg_id": 5, "raw_text": "Working..."})()
+        final = type("Message", (), {"id": 12, "sender_id": 7, "reply_to_msg_id": 5, "raw_text": "done marker-123"})()
+
+        class Client:
+            async def iter_messages(self, entity, limit):
+                yield progress
+                yield final
+
+        reply = asyncio.run(
+            _wait_for_bot_reply(
+                Client(),
+                object(),
+                7,
+                after_id=5,
+                timeout_seconds=1,
+                text_contains="marker-123",
+            )
+        )
+
+        self.assertIs(reply, final)
 
     def test_bot_lookup_reference_prefers_username(self):
         self.assertEqual(bot_lookup_reference(BotIdentity(user_id=123456789, username="botname", first_name="Bot")), "@botname")

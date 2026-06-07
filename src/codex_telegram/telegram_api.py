@@ -7,6 +7,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from .telegram_format import MDV2_PARSE_MODE, format_message_mdv2, split_telegram_text, strip_mdv2
+
 
 class TelegramAPIError(RuntimeError):
     pass
@@ -110,25 +112,17 @@ def parse_callback_update(update: dict[str, Any]) -> IncomingCallback | None:
     )
 
 
-def split_telegram_text(text: str, *, limit: int = 4096) -> list[str]:
-    if len(text) <= limit:
-        return [text]
-    chunks: list[str] = []
-    remaining = text
-    while remaining:
-        chunk = remaining[:limit]
-        split_at = max(chunk.rfind("\n"), chunk.rfind(" "))
-        if split_at > limit // 2:
-            chunk = chunk[: split_at + 1]
-        chunks.append(chunk)
-        remaining = remaining[len(chunk) :]
-    return chunks
-
-
 class TelegramAPI:
-    def __init__(self, token: str, *, request_timeout_seconds: int = 45):
+    def __init__(
+        self,
+        token: str,
+        *,
+        request_timeout_seconds: int = 45,
+        disable_link_previews: bool = False,
+    ):
         self._base_url = f"https://api.telegram.org/bot{token}"
         self._request_timeout_seconds = request_timeout_seconds
+        self._disable_link_previews = disable_link_previews
 
     def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         data = urllib.parse.urlencode(
@@ -239,21 +233,53 @@ class TelegramAPI:
         reply_to_message_id: int | None = None,
         message_thread_id: int | None = None,
         reply_markup: dict[str, Any] | None = None,
+        parse_markdown: bool = True,
     ) -> None:
-        for chunk in split_telegram_text(text):
-            self._request(
-                "sendMessage",
-                {
-                    "chat_id": chat_id,
-                    "text": chunk,
-                    "message_thread_id": message_thread_id,
-                    "reply_to_message_id": reply_to_message_id,
-                    "disable_web_page_preview": True,
-                    "reply_markup": reply_markup,
-                },
+        if not text or not text.strip():
+            return
+        rendered = format_message_mdv2(text) if parse_markdown else text.strip()
+        previous_message_id: int | None = None
+        for index, chunk in enumerate(split_telegram_text(rendered)):
+            active_reply_to = reply_to_message_id if index == 0 else previous_message_id
+            payload = self._send_message_chunk(
+                chat_id,
+                chunk,
+                reply_to_message_id=active_reply_to,
+                message_thread_id=message_thread_id,
+                reply_markup=reply_markup,
+                parse_markdown=parse_markdown,
             )
-            reply_to_message_id = None
+            previous_message_id = _message_id_from_payload(payload)
             reply_markup = None
+
+    def _send_message_chunk(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        reply_to_message_id: int | None,
+        message_thread_id: int | None,
+        reply_markup: dict[str, Any] | None,
+        parse_markdown: bool,
+    ) -> dict[str, Any]:
+        params = {
+            "chat_id": chat_id,
+            "text": text,
+            "message_thread_id": message_thread_id,
+            "reply_to_message_id": reply_to_message_id,
+            "parse_mode": MDV2_PARSE_MODE if parse_markdown else None,
+            "disable_web_page_preview": True if self._disable_link_previews else None,
+            "reply_markup": reply_markup,
+        }
+        try:
+            return self._request("sendMessage", params)
+        except TelegramAPIError as exc:
+            if not parse_markdown or not _is_markdown_parse_error(exc):
+                raise
+            fallback = dict(params)
+            fallback["text"] = strip_mdv2(text)
+            fallback["parse_mode"] = None
+            return self._request("sendMessage", fallback)
 
     def edit_message_text(
         self,
@@ -262,17 +288,28 @@ class TelegramAPI:
         text: str,
         *,
         reply_markup: dict[str, Any] | None = None,
+        parse_markdown: bool = True,
     ) -> None:
-        self._request(
-            "editMessageText",
-            {
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": text,
-                "disable_web_page_preview": True,
-                "reply_markup": reply_markup,
-            },
-        )
+        if not text or not text.strip():
+            return
+        rendered = format_message_mdv2(text) if parse_markdown else text.strip()
+        params = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": rendered,
+            "parse_mode": MDV2_PARSE_MODE if parse_markdown else None,
+            "disable_web_page_preview": True if self._disable_link_previews else None,
+            "reply_markup": reply_markup,
+        }
+        try:
+            self._request("editMessageText", params)
+        except TelegramAPIError as exc:
+            if not parse_markdown or not _is_markdown_parse_error(exc):
+                raise
+            fallback = dict(params)
+            fallback["text"] = strip_mdv2(rendered)
+            fallback["parse_mode"] = None
+            self._request("editMessageText", fallback)
 
     def answer_callback_query(self, callback_query_id: str, *, text: str | None = None) -> None:
         self._request("answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text})
@@ -288,3 +325,16 @@ class TelegramAPI:
             "sendChatAction",
             {"chat_id": chat_id, "action": action, "message_thread_id": message_thread_id},
         )
+
+
+def _message_id_from_payload(payload: dict[str, Any]) -> int | None:
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return None
+    message_id = result.get("message_id")
+    return message_id if isinstance(message_id, int) else None
+
+
+def _is_markdown_parse_error(error: TelegramAPIError) -> bool:
+    text = str(error).lower()
+    return "markdown" in text or "can't parse entities" in text or "message entity" in text
