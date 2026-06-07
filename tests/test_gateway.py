@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import json
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import codex_telegram.gateway as gateway_module
 from codex_telegram.codex_runner import EMPTY_CODEX_RESPONSE, CodexResult
 from codex_telegram.config import Settings
-from codex_telegram.gateway import CodexTelegramGateway, sanitize_progress_text
+from codex_telegram.gateway import (
+    CodexTelegramGateway,
+    safe_command_progress_preview,
+    sanitize_progress_text,
+    shape_telegram_response_text,
+)
 from codex_telegram.model_catalog import ModelChoice
 from codex_telegram.session_store import SessionStore
 from codex_telegram.telegram_api import ChatInfo, ForumTopic, IncomingCallback, IncomingMessage, TelegramAPIError
@@ -113,6 +120,7 @@ class FakeCodex:
             self.responses = []
             self.response = response
         self.emit_progress = False
+        self.sleep_seconds = 0.0
 
     def run(
         self,
@@ -139,6 +147,8 @@ class FakeCodex:
                     },
                 }
             )
+        if self.sleep_seconds:
+            time.sleep(self.sleep_seconds)
         text = self.responses.pop(0) if self.responses else self.response
         return CodexResult(text=text, returncode=0, stderr="")
 
@@ -340,6 +350,48 @@ class GatewayTests(unittest.TestCase):
         self.assertIn("<chat>", text)
         self.assertNotIn("abcdefghijklmnopqrstuvwxyz", text)
         self.assertNotIn("-1001234567890", text)
+
+    def test_progress_text_redacts_positive_telegram_ids(self):
+        text = sanitize_progress_text("telegram-send user_id=123456789 chat_id=987654321 bare 123456789")
+
+        self.assertEqual(text, "telegram-send user_id=<id> chat_id=<id> bare <id>")
+
+    def test_shape_telegram_response_text_expands_dense_inline_code_lists(self):
+        shaped = shape_telegram_response_text(
+            "Folders on your Desktop:\n\n`.agents`, `.git`, `codex-telegram`, `tailwind`."
+        )
+
+        self.assertEqual(
+            shaped,
+            "Folders on your Desktop:\n\n- `.agents`\n- `.git`\n- `codex-telegram`\n- `tailwind`",
+        )
+
+    def test_shape_telegram_response_text_preserves_code_blocks(self):
+        shaped = shape_telegram_response_text("```text\n`a`, `b`, `c`\n```\n~~~text\n`d`, `e`, `f`\n~~~")
+
+        self.assertEqual(shaped, "```text\n`a`, `b`, `c`\n```\n~~~text\n`d`, `e`, `f`\n~~~")
+
+    def test_shape_telegram_response_text_preserves_long_fence_code_blocks(self):
+        text = "````text\n```\n`a`, `b`, `c`\n```\n````"
+        shaped = shape_telegram_response_text(text)
+
+        self.assertEqual(shaped, text)
+
+    def test_shape_telegram_response_text_preserves_indented_code_blocks(self):
+        shaped = shape_telegram_response_text("    `a`, `b`, `c`")
+
+        self.assertEqual(shaped, "    `a`, `b`, `c`")
+
+    def test_safe_command_progress_preview_allows_simple_shell_commands(self):
+        self.assertEqual(safe_command_progress_preview("/bin/bash -lc pwd"), "pwd")
+        self.assertEqual(safe_command_progress_preview(["/bin/bash", "-lc", "ls -la src"]), "ls -la src")
+
+    def test_safe_command_progress_preview_rejects_risky_command_text(self):
+        self.assertIsNone(safe_command_progress_preview("python - <<'PY'\nprint('code')\nPY"))
+        self.assertIsNone(safe_command_progress_preview("curl -H 'Authorization: Bearer abc' https://example.test"))
+        self.assertIsNone(safe_command_progress_preview("python -c 'print(1)'"))
+        self.assertIsNone(safe_command_progress_preview(["node", "--eval=console.log(1)"]))
+        self.assertIsNone(safe_command_progress_preview(["perl", "-eprint 1"]))
 
     def test_workspace_command_shows_folder_buttons(self):
         with TemporaryDirectory() as tmp:
@@ -1034,7 +1086,8 @@ class GatewayTests(unittest.TestCase):
             gateway.handle_message(self._message("do work", chat_id="-1001", message_thread_id=7))
 
             self.assertEqual(codex.runs[-1], (None, None, root.resolve(), None))
-            self.assertIn("Working: running a local command", telegram.messages[-2][1])
+            self.assertIn("🖥 terminal:", telegram.messages[-2][1])
+            self.assertIn("pwd", telegram.messages[-2][1])
             self.assertEqual(telegram.message_threads[-2], 7)
             self.assertEqual(telegram.messages[-1][1], "final response")
             self.assertEqual(telegram.message_threads[-1], 7)
@@ -1066,8 +1119,35 @@ class GatewayTests(unittest.TestCase):
             callback(event)
 
             self.assertEqual(len(telegram.messages), 1)
-            self.assertIn("Working: running a local command", telegram.messages[0][1])
+            self.assertIn("🖥 terminal:", telegram.messages[0][1])
             self.assertEqual(telegram.message_threads, [7])
+
+    def test_typing_indicator_refreshes_until_request_finishes(self):
+        with TemporaryDirectory() as tmp:
+            telegram = FakeTelegram()
+            codex = FakeCodex("finished")
+            codex.sleep_seconds = 0.04
+            gateway = CodexTelegramGateway(
+                settings=self._settings(Path(tmp)),
+                telegram=telegram,
+                codex=codex,
+                model_catalog=FakeModelCatalog(),
+                sessions=SessionStore(Path(tmp) / "state"),
+            )
+            original_interval = gateway_module.TYPING_REFRESH_INTERVAL_SECONDS
+            gateway_module.TYPING_REFRESH_INTERVAL_SECONDS = 0.01
+            try:
+                gateway.handle_message(self._message("do it", chat_id="-1001", message_thread_id=7))
+            finally:
+                gateway_module.TYPING_REFRESH_INTERVAL_SECONDS = original_interval
+
+            action_count = len(telegram.actions)
+            time.sleep(0.03)
+
+            self.assertGreaterEqual(action_count, 2)
+            self.assertEqual(len(telegram.actions), action_count)
+            self.assertTrue(all(action == "-1001:thread:7:typing" for action in telegram.actions))
+            self.assertEqual(telegram.messages[-1][1], "finished")
 
     def test_goal_command_is_topic_scoped_and_general_chat_does_not_mutate_topics(self):
         with TemporaryDirectory() as tmp:

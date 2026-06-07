@@ -8,7 +8,11 @@ from codex_telegram.e2e_harness import (
     BotIdentity,
     CheckResult,
     ServiceStatus,
+    _bot_messages_after,
     _bot_reply_chain_after,
+    _keyboard_results,
+    _raw_typing_update_from_bot,
+    _runtime_ux_results,
     _ui_long_results,
     _ui_parity_results,
     _wait_for_bot_reply,
@@ -188,6 +192,41 @@ class E2EHarnessTests(unittest.TestCase):
 
         self.assertEqual(chain, [root, continuation])
 
+    def test_bot_messages_after_returns_sorted_bot_messages(self):
+        first = type("Message", (), {"id": 12, "sender_id": 7, "raw_text": "progress"})()
+        second = type("Message", (), {"id": 13, "sender_id": 7, "raw_text": "final"})()
+        unrelated = type("Message", (), {"id": 14, "sender_id": 9, "raw_text": "unrelated"})()
+
+        class Client:
+            async def iter_messages(self, entity, limit):
+                yield unrelated
+                yield second
+                yield first
+
+        messages = asyncio.run(_bot_messages_after(Client(), object(), 7, after_id=5))
+
+        self.assertEqual(messages, [first, second])
+
+    def test_raw_typing_update_from_bot_matches_user_ids(self):
+        matching = type("UpdateChannelUserTyping", (), {"from_id": type("PeerUser", (), {"user_id": 7})()})()
+        other = type("UpdateChannelUserTyping", (), {"from_id": type("PeerUser", (), {"user_id": 8})()})()
+        no_id = type("UpdateUserTyping", (), {})()
+        non_typing = type("UpdateNewMessage", (), {"user_id": 7})()
+
+        self.assertTrue(_raw_typing_update_from_bot(matching, 7))
+        self.assertTrue(_raw_typing_update_from_bot(no_id, 7))
+        self.assertFalse(_raw_typing_update_from_bot(other, 7))
+        self.assertFalse(_raw_typing_update_from_bot(non_typing, 7))
+
+    def test_raw_typing_update_from_bot_scopes_private_chat_updates(self):
+        private_matching = type("UpdateUserTyping", (), {"user_id": 7})()
+        private_other = type("UpdateUserTyping", (), {"user_id": 8})()
+        group_matching = type("UpdateChannelUserTyping", (), {"from_id": type("PeerUser", (), {"user_id": 7})()})()
+
+        self.assertTrue(_raw_typing_update_from_bot(private_matching, 7, private_chat=True))
+        self.assertFalse(_raw_typing_update_from_bot(private_other, 7, private_chat=True))
+        self.assertFalse(_raw_typing_update_from_bot(group_matching, 7, private_chat=True))
+
     def test_wait_for_bot_reply_can_filter_by_marker_text(self):
         progress = type("Message", (), {"id": 11, "sender_id": 7, "reply_to_msg_id": 5, "raw_text": "Working..."})()
         final = type("Message", (), {"id": 12, "sender_id": 7, "reply_to_msg_id": 5, "raw_text": "done marker-123"})()
@@ -209,6 +248,59 @@ class E2EHarnessTests(unittest.TestCase):
         )
 
         self.assertIs(reply, final)
+
+    def test_runtime_ux_results_require_typing_progress_and_clean_list(self):
+        progress = type("Message", (), {"id": 11, "raw_text": "🖥 terminal: sleep 6"})()
+        final = type(
+            "Message",
+            (),
+            {
+                "id": 12,
+                "raw_text": "nim-runtime-ux-1\n\nFolders on your Desktop:\n\n- .agents\n- .git\n- codex-telegram\n- tailwind",
+            },
+        )()
+
+        checks = _runtime_ux_results(final, "nim-runtime-ux-1", bot_messages=[progress, final], typing_seen=True)
+
+        self.assertTrue(all(check.passed for check in checks), checks)
+
+    def test_runtime_ux_results_fail_dense_list(self):
+        progress = type("Message", (), {"id": 11, "raw_text": "🖥 terminal: sleep 6"})()
+        final = type(
+            "Message",
+            (),
+            {
+                "id": 12,
+                "raw_text": "nim-runtime-ux-1\n\nFolders on your Desktop:\n\n.agents, .git, codex-telegram, tailwind",
+            },
+        )()
+
+        checks = _runtime_ux_results(final, "nim-runtime-ux-1", bot_messages=[progress, final], typing_seen=True)
+        list_check = next(check for check in checks if check.name == "runtime ux list shaping")
+
+        self.assertFalse(list_check.passed)
+
+    def test_keyboard_results_accept_telethon_buttons(self):
+        reply = type("Message", (), {"id": 22, "buttons": [[object()]], "reply_markup": None})()
+
+        checks = _keyboard_results("/models", reply)
+
+        self.assertTrue(all(check.passed for check in checks), checks)
+
+    def test_keyboard_results_accept_reply_markup_rows(self):
+        reply_markup = type("ReplyMarkup", (), {"rows": [object()]})()
+        reply = type("Message", (), {"id": 22, "buttons": None, "reply_markup": reply_markup})()
+
+        checks = _keyboard_results("/sandbox", reply)
+
+        self.assertTrue(all(check.passed for check in checks), checks)
+
+    def test_keyboard_results_fail_missing_buttons(self):
+        reply = type("Message", (), {"id": 22, "buttons": None, "reply_markup": None})()
+
+        checks = _keyboard_results("/workspace", reply)
+
+        self.assertFalse(checks[0].passed)
 
     def test_bot_lookup_reference_prefers_username(self):
         self.assertEqual(bot_lookup_reference(BotIdentity(user_id=123456789, username="botname", first_name="Bot")), "@botname")

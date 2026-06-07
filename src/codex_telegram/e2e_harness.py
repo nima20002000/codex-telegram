@@ -253,10 +253,11 @@ async def run_telegram_checks(
     bot_identity: BotIdentity,
     marker: bool,
     ui_parity: bool,
+    runtime_ux: bool,
     marker_timeout_seconds: int,
 ) -> list[CheckResult]:
     try:
-        from telethon import TelegramClient
+        from telethon import TelegramClient, events
         from telethon.tl.functions.channels import GetParticipantRequest
     except ImportError as exc:
         raise E2EHarnessError("Telethon is not installed in this Python environment") from exc
@@ -318,6 +319,19 @@ async def run_telegram_checks(
                     "target chat is allowed" if target_chat_id in allowed_chats else "target chat is not in TELEGRAM_ALLOWED_CHATS",
                 )
             )
+            if runtime_ux:
+                private_chat_allowed = str(admin_id) in allowed_chats
+                results.append(
+                    CheckResult(
+                        "runtime private chat allowlisted",
+                        private_chat_allowed,
+                        "admin private chat is allowed"
+                        if private_chat_allowed
+                        else "TELEGRAM_ALLOWED_CHATS does not include admin private chat; skipping private runtime UX probe",
+                    )
+                )
+                if not private_chat_allowed:
+                    runtime_ux = False
         else:
             results.append(
                 CheckResult(
@@ -326,6 +340,14 @@ async def run_telegram_checks(
                     "TELEGRAM_ALLOWED_CHATS is empty; gateway does not restrict chats",
                 )
             )
+            if runtime_ux:
+                results.append(
+                    CheckResult(
+                        "runtime private chat allowlisted",
+                        True,
+                        "TELEGRAM_ALLOWED_CHATS is empty; private runtime UX probe is allowed",
+                    )
+                )
 
         bot_entity = await client.get_entity(bot_lookup_reference(bot_identity))
         bot_user_id = int(bot_entity.id)
@@ -414,6 +436,56 @@ async def run_telegram_checks(
                 after_id=int(long_sent.id),
             )
             results.extend(_ui_long_results(long_reply, long_marker, related_messages=long_related))
+        if runtime_ux:
+            runtime_marker = f"nim-runtime-ux-{int(time.time())}"
+            prompt = (
+                "Do not modify files. Run this shell command exactly, then reply with the exact final text below.\n\n"
+                "Shell command:\n"
+                "sleep 6 && printf '%s\\n' .agents .git codex-telegram tailwind\n\n"
+                "Final text:\n"
+                f"{runtime_marker}\n\n"
+                "Folders on your Desktop:\n\n"
+                "`.agents`, `.git`, `codex-telegram`, `tailwind`."
+            )
+            typing_seen = asyncio.Event()
+
+            async def raw_typing_handler(update: Any) -> None:
+                if _raw_typing_update_from_bot(update, bot_user_id, private_chat=True):
+                    typing_seen.set()
+
+            client.add_event_handler(raw_typing_handler, events.Raw)
+            try:
+                sent = await client.send_message(bot_entity, prompt, parse_mode=None)
+                runtime_reply = await _wait_for_bot_reply(
+                    client,
+                    bot_entity,
+                    bot_user_id,
+                    after_id=int(sent.id),
+                    timeout_seconds=marker_timeout_seconds,
+                    text_contains=runtime_marker,
+                )
+                await asyncio.sleep(2)
+                bot_messages = await _bot_messages_after(client, bot_entity, bot_user_id, after_id=int(sent.id))
+            finally:
+                client.remove_event_handler(raw_typing_handler, events.Raw)
+            results.extend(
+                _runtime_ux_results(
+                    runtime_reply,
+                    runtime_marker,
+                    bot_messages=bot_messages,
+                    typing_seen=typing_seen.is_set(),
+                )
+            )
+            for command in ("/models", "/workspace", "/sandbox"):
+                keyboard_sent = await client.send_message(bot_entity, command, parse_mode=None)
+                keyboard_reply = await _wait_for_bot_reply(
+                    client,
+                    bot_entity,
+                    bot_user_id,
+                    after_id=int(keyboard_sent.id),
+                    timeout_seconds=marker_timeout_seconds,
+                )
+                results.extend(_keyboard_results(command, keyboard_reply))
     finally:
         await client.disconnect()
     return results
@@ -472,6 +544,43 @@ async def _bot_reply_chain_after(
             chain.append(message)
             chain_ids.add(message_id)
     return chain
+
+
+async def _bot_messages_after(
+    client: Any,
+    entity: Any,
+    bot_id: int,
+    *,
+    after_id: int,
+    limit: int = 80,
+) -> list[Any]:
+    messages: list[Any] = []
+    async for message in client.iter_messages(entity, limit=limit):
+        if int(getattr(message, "id", 0)) <= after_id:
+            continue
+        if getattr(message, "sender_id", None) == bot_id:
+            messages.append(message)
+    messages.sort(key=lambda item: int(getattr(item, "id", 0)))
+    return messages
+
+
+def _raw_typing_update_from_bot(update: Any, bot_user_id: int, *, private_chat: bool = False) -> bool:
+    update_type = update.__class__.__name__
+    if "Typing" not in update_type:
+        return False
+    if private_chat:
+        return update_type == "UpdateUserTyping" and getattr(update, "user_id", None) == bot_user_id
+    candidate_ids: set[int] = set()
+    for attr in ("user_id",):
+        value = getattr(update, attr, None)
+        if isinstance(value, int):
+            candidate_ids.add(value)
+    for attr in ("from_id", "peer"):
+        value = getattr(update, attr, None)
+        user_id = getattr(value, "user_id", None)
+        if isinstance(user_id, int):
+            candidate_ids.add(user_id)
+    return bot_user_id in candidate_ids if candidate_ids else True
 
 
 def _entity_type_names(message: Any) -> set[str]:
@@ -537,6 +646,76 @@ def _ui_long_results(reply: Any | None, marker: str, *, related_messages: list[A
     ]
 
 
+def _runtime_ux_results(
+    reply: Any | None,
+    marker: str,
+    *,
+    bot_messages: list[Any],
+    typing_seen: bool,
+) -> list[CheckResult]:
+    if reply is None:
+        return [CheckResult("runtime ux final reply", False, "no bot final reply before timeout")]
+
+    final_text = str(getattr(reply, "raw_text", "") or getattr(reply, "text", "") or "")
+    all_text = "\n".join(str(getattr(message, "raw_text", "") or getattr(message, "text", "") or "") for message in bot_messages)
+    final_id = int(getattr(reply, "id", 0))
+    progress_messages = [
+        message
+        for message in bot_messages
+        if int(getattr(message, "id", 0)) < final_id
+        and "terminal" in str(getattr(message, "raw_text", "") or getattr(message, "text", "") or "").lower()
+    ]
+    clean_list = (
+        "- .agents" in final_text
+        and "- .git" in final_text
+        and "- codex-telegram" in final_text
+        and "- tailwind" in final_text
+        and "`.agents`" not in all_text
+        and ", `.git`" not in all_text
+    )
+    return [
+        CheckResult(
+            "runtime ux typing",
+            typing_seen,
+            "raw Telegram typing update observed" if typing_seen else "no Telegram typing update observed",
+        ),
+        CheckResult(
+            "runtime ux progress",
+            bool(progress_messages),
+            f"progress messages={len(progress_messages)}" if progress_messages else "no terminal progress bubble before final reply",
+        ),
+        CheckResult("runtime ux final reply", True, f"reply message id={getattr(reply, 'id', 'unknown')}"),
+        CheckResult("runtime ux marker", marker in final_text, "marker present" if marker in final_text else "marker missing"),
+        CheckResult(
+            "runtime ux list shaping",
+            clean_list,
+            "folder list rendered as lines" if clean_list else "folder list still appears dense or missing items",
+        ),
+    ]
+
+
+def _message_has_inline_keyboard(message: Any) -> bool:
+    buttons = getattr(message, "buttons", None)
+    if buttons:
+        return True
+    reply_markup = getattr(message, "reply_markup", None)
+    rows = getattr(reply_markup, "rows", None)
+    return bool(rows)
+
+
+def _keyboard_results(command: str, reply: Any | None) -> list[CheckResult]:
+    if reply is None:
+        return [CheckResult(f"runtime ux {command} keyboard", False, "no bot reply before timeout")]
+    has_keyboard = _message_has_inline_keyboard(reply)
+    return [
+        CheckResult(
+            f"runtime ux {command} keyboard",
+            has_keyboard,
+            f"reply message id={getattr(reply, 'id', 'unknown')}" if has_keyboard else "reply has no inline keyboard",
+        )
+    ]
+
+
 def _print_results(results: Iterable[CheckResult], *, token: str | None, api_hash: str | None) -> bool:
     ok = True
     for result in results:
@@ -558,6 +737,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-service-commit", help="Fail if the service checkout is on a different short commit.")
     parser.add_argument("--marker", action="store_true", help="Send a harmless /status marker and wait for the bot reply.")
     parser.add_argument("--ui-parity", action="store_true", help="Send a harmless Markdown fixture and inspect Telegram-rendered reply entities.")
+    parser.add_argument("--runtime-ux", action="store_true", help="Send a harmless runtime UX fixture and inspect typing/progress/final list messages.")
     parser.add_argument("--marker-timeout-seconds", type=int, default=60)
     return parser
 
@@ -598,6 +778,7 @@ def main(argv: list[str] | None = None) -> int:
                     bot_identity=bot_identity,
                     marker=args.marker,
                     ui_parity=args.ui_parity,
+                    runtime_ux=args.runtime_ux,
                     marker_timeout_seconds=args.marker_timeout_seconds,
                 )
             )

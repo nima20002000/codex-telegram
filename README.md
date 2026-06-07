@@ -124,11 +124,15 @@ In private chats and topic-scoped sessions, any other text message is sent to
 `codex exec`. In a forum group's General chat, free-form text is handled by the
 General controller agent, which can create and manage topic sessions.
 
-While Codex is working, the bridge may post short progress messages in the same
-topic, such as local command start/finish notices. Progress messages are
+While Codex is working, the bridge refreshes Telegram's native `typing` chat
+action so clients can show the animated typing header during longer runs. When
+Codex emits structured command events, the bridge posts compact Hermes-style
+terminal progress bubbles with short safe previews. Progress messages are
 rate-limited and sanitized: code blocks, raw diffs, bot tokens, `.env` paths,
 Telegram session files, and private chat IDs are suppressed or redacted before
 Telegram sees them. The final Codex answer is still sent after the run finishes.
+Dense inline folder/file lists in final answers are reshaped into readable lines
+where that is presentation-safe.
 
 `/compact` is for topic-backed Codex sessions. It summarizes that topic's saved
 Telegram conversation context, stores the compact summary locally, clears the

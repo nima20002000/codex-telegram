@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shlex
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 AUTO_COMPACT_HISTORY_CHARS = 24000
 PROGRESS_MIN_INTERVAL_SECONDS = 5.0
+TYPING_REFRESH_INTERVAL_SECONDS = 2.0
 GENERAL_MEMORY_MAX_CHARS = 500
 REASONING_EFFORT_RANK = {
     "minimal": 0,
@@ -50,12 +53,20 @@ SECRET_ASSIGNMENT_RE = re.compile(
 )
 BOT_TOKEN_RE = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b")
 PRIVATE_CHAT_ID_RE = re.compile(r"-100\d{6,}")
+TELEGRAM_PARAM_ID_RE = re.compile(r"(?i)\b(chat_id|user_id)=\d{6,}\b")
+LARGE_ID_RE = re.compile(r"\b\d{8,}\b")
 ENV_PATH_RE = re.compile(r"\S*\.env(?:\.\S+)?")
 SESSION_PATH_RE = re.compile(r"\S+\.session\b")
 ABSOLUTE_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9:/])/(?:home|tmp|var|etc|usr|opt|root|mnt|media|run|dev|proc|srv)"
     r"(?:/[A-Za-z0-9._-]+)*"
 )
+INLINE_CODE_LIST_RE = re.compile(r"`([^`\n]+)`(?:\s*[,;]\s*|\s*\.?\s*$)")
+FENCE_MARKER_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+UNSAFE_COMMAND_PREVIEW_RE = re.compile(
+    r"(?i)(authorization|bearer|password|secret|token|api[_-]?key|api[_-]?hash)|[`$<>{}\n\r]|```|&&|\|\||[;|]"
+)
+CODE_EXEC_FLAGS = {"-c", "-e", "--eval", "--execute"}
 
 
 @dataclass(frozen=True)
@@ -93,6 +104,43 @@ class GeneralControllerOutcome:
     memory_text: str
     success: bool = True
     summary: str = ""
+
+
+class TypingRefresh:
+    def __init__(
+        self,
+        *,
+        telegram: TelegramAPI,
+        chat_id: str,
+        message_thread_id: int | None,
+        interval_seconds: float,
+    ):
+        self._telegram = telegram
+        self._chat_id = chat_id
+        self._message_thread_id = message_thread_id
+        self._interval_seconds = interval_seconds
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _send(self) -> None:
+        try:
+            self._telegram.send_chat_action(self._chat_id, message_thread_id=self._message_thread_id)
+        except Exception:
+            logger.warning("Failed to send Telegram typing indicator", exc_info=True)
+
+    def start(self) -> None:
+        self._send()
+        self._thread = threading.Thread(target=self._run, name="codex-telegram-typing", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval_seconds):
+            self._send()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
 
 
 GENERAL_CONTROLLER_PROMPT = """You are the trusted General-chat controller and operator for a private Telegram forum group.
@@ -159,6 +207,8 @@ def sanitize_progress_text(text: str) -> str | None:
     sanitized = BOT_TOKEN_RE.sub("<redacted-token>", sanitized)
     sanitized = SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}=<redacted>", sanitized)
     sanitized = PRIVATE_CHAT_ID_RE.sub("<chat>", sanitized)
+    sanitized = TELEGRAM_PARAM_ID_RE.sub(lambda match: f"{match.group(1)}=<id>", sanitized)
+    sanitized = LARGE_ID_RE.sub("<id>", sanitized)
     sanitized = ENV_PATH_RE.sub("<env-file>", sanitized)
     sanitized = SESSION_PATH_RE.sub("<session-file>", sanitized)
     sanitized = ABSOLUTE_PATH_RE.sub("<path>", sanitized)
@@ -184,6 +234,107 @@ def sanitize_general_memory_text(text: str) -> str:
     if len(sanitized) > GENERAL_MEMORY_MAX_CHARS:
         sanitized = sanitized[: GENERAL_MEMORY_MAX_CHARS - 3].rstrip() + "..."
     return sanitized
+
+
+def _shape_inline_code_list_line(line: str) -> list[str] | None:
+    if line.startswith(("    ", "\t")):
+        return None
+    stripped = line.strip()
+    if "`" not in stripped or stripped.startswith(("```", "- ", "* ", "• ")):
+        return None
+    matches = list(INLINE_CODE_LIST_RE.finditer(stripped))
+    if len(matches) < 3:
+        return None
+    consumed = "".join(match.group(0) for match in matches).strip()
+    if consumed != stripped:
+        return None
+    return [f"- `{match.group(1)}`" for match in matches]
+
+
+def _fence_marker(line: str) -> str | None:
+    match = FENCE_MARKER_RE.match(line)
+    return match.group(1) if match else None
+
+
+def _closes_fence(line: str, opener: str) -> bool:
+    match = FENCE_MARKER_RE.match(line)
+    if match is None:
+        return False
+    marker = match.group(1)
+    if marker[0] != opener[0] or len(marker) < len(opener):
+        return False
+    return line[match.end() :].strip() == ""
+
+
+def shape_telegram_response_text(text: str) -> str:
+    lines = text.splitlines()
+    shaped: list[str] = []
+    fence_marker: str | None = None
+    for line in lines:
+        marker = _fence_marker(line)
+        if marker is not None:
+            if fence_marker is None:
+                fence_marker = marker
+            elif _closes_fence(line, fence_marker):
+                fence_marker = None
+            shaped.append(line)
+            continue
+        if fence_marker is not None:
+            shaped.append(line)
+            continue
+        list_lines = _shape_inline_code_list_line(line)
+        if list_lines is None:
+            shaped.append(line)
+        else:
+            shaped.extend(list_lines)
+    return "\n".join(shaped)
+
+
+def safe_command_progress_preview(command: object) -> str | None:
+    if isinstance(command, str):
+        raw_command = command
+        if UNSAFE_COMMAND_PREVIEW_RE.search(raw_command):
+            return None
+        try:
+            parts = shlex.split(raw_command)
+        except ValueError:
+            return None
+    elif isinstance(command, list):
+        parts = [str(part) for part in command]
+        raw_command = " ".join(parts)
+        if UNSAFE_COMMAND_PREVIEW_RE.search(raw_command):
+            return None
+    else:
+        return None
+    if not parts:
+        return None
+
+    candidate_parts = parts[:3]
+    executable = Path(parts[0]).name
+    if executable in {"bash", "sh", "zsh"} and len(parts) >= 3 and parts[1] == "-lc":
+        shell_script = parts[2].strip()
+        if UNSAFE_COMMAND_PREVIEW_RE.search(shell_script):
+            return None
+        try:
+            candidate_parts = shlex.split(shell_script)[:4]
+        except ValueError:
+            return None
+    if any(_is_code_exec_flag(part) for part in candidate_parts):
+        return None
+
+    preview = " ".join(candidate_parts).strip()
+    if not preview or len(preview) > 100:
+        return None
+    return sanitize_progress_text(preview)
+
+
+def _is_code_exec_flag(part: str) -> bool:
+    return (
+        part in CODE_EXEC_FLAGS
+        or part.startswith("--eval=")
+        or part.startswith("--execute=")
+        or (len(part) > 2 and part[:2] in {"-c", "-e"})
+    )
 
 
 class CodexTelegramGateway:
@@ -1061,7 +1212,7 @@ class CodexTelegramGateway:
         )
 
     def _telegram_response_text(self, text: str) -> str:
-        response = text.strip()
+        response = shape_telegram_response_text(text.strip())
         if len(response) > self._settings.max_telegram_response_chars:
             response = response[: self._settings.max_telegram_response_chars].rstrip()
             response += "\n\n[Response truncated by MAX_TELEGRAM_RESPONSE_CHARS.]"
@@ -1452,13 +1603,16 @@ class CodexTelegramGateway:
         event_type = event.get("type")
         if item_type != "command_execution":
             return None
+        command_preview = safe_command_progress_preview(item.get("command"))
         if event_type == "item.started":
-            return sanitize_progress_text("Working: running a local command for this topic.")
+            if command_preview:
+                return sanitize_progress_text(f"🖥 terminal: {command_preview}")
+            return sanitize_progress_text("🖥 terminal: running local command")
         if event_type == "item.completed":
             exit_code = item.get("exit_code")
             if exit_code == 0:
-                return sanitize_progress_text("Working: local command finished.")
-            return sanitize_progress_text("Working: local command failed; the final answer will summarize it.")
+                return sanitize_progress_text("✅ terminal finished")
+            return sanitize_progress_text("⚠️ terminal failed; final answer will summarize it")
         return None
 
     def _progress_callback_for_message(self, message: IncomingMessage):
@@ -1491,6 +1645,16 @@ class CodexTelegramGateway:
                 logger.warning("Failed to restore Telegram typing indicator after progress message", exc_info=True)
 
         return callback
+
+    def _start_typing_refresh(self, message: IncomingMessage) -> TypingRefresh:
+        refresh = TypingRefresh(
+            telegram=self._telegram,
+            chat_id=message.chat_id,
+            message_thread_id=message.message_thread_id,
+            interval_seconds=TYPING_REFRESH_INTERVAL_SECONDS,
+        )
+        refresh.start()
+        return refresh
 
     @staticmethod
     def _button(text: str, callback_data: str) -> dict[str, str]:
@@ -1605,12 +1769,9 @@ class CodexTelegramGateway:
         self._maybe_auto_compact(message, session_key)
         prompt = self._build_codex_prompt(message)
         self._sessions.append(session_key, "user", message.text)
-        try:
-            self._telegram.send_chat_action(message.chat_id, message_thread_id=message.message_thread_id)
-        except Exception:
-            logger.warning("Failed to send Telegram typing indicator", exc_info=True)
         preference = self._effective_model_preference(session_key)
         self._active_session_keys.add(session_key)
+        typing_refresh = self._start_typing_refresh(message)
         try:
             result = self._codex.run(
                 prompt,
@@ -1621,6 +1782,7 @@ class CodexTelegramGateway:
                 progress_callback=self._progress_callback_for_message(message),
             )
         finally:
+            typing_refresh.stop()
             self._active_session_keys.discard(session_key)
         response = self._telegram_response_text(result.text)
         self._sessions.append(session_key, "assistant", response)

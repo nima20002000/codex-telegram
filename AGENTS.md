@@ -84,6 +84,14 @@ that Telegram returned rendered entities instead of raw Markdown markers. Record
 the redacted `[PASS] ui parity ...` lines in Linear with the review output path
 and commit hash.
 
+For v0.5 runtime UX checks, add `--runtime-ux` as well. This uses the bot's
+private chat for a harmless long-running command fixture, watches for Telegram
+typing updates through Telethon, and inspects the bot's real Telegram messages
+for Hermes-style terminal progress and clean folder-list shaping. Record the redacted
+`[PASS] runtime ux ...` lines in Linear. If Codex approval events are still not
+available from `codex exec --json`, record that blocker on NIM-223 instead of
+claiming approval-card parity.
+
 ## Commit & Pull Request Guidelines
 
 Recent commits use short imperative subjects, for example `Add Telegram model picker` and `Fix stale Codex model preferences`. Keep commits scoped to one behavior change and include tests or a clear reason tests were not run. Pull requests should describe the runtime impact, list validation commands, and mention any configuration or systemd changes. Include screenshots only for Telegram UI-visible command or button changes.
